@@ -301,6 +301,99 @@ def admin_create():
     return jsonify(ok=True, role=role)
 
 
+# =============================== FORUM ===================================== #
+@app.post("/forum/post")
+def forum_post():
+    if rate_limited():
+        return jsonify(ok=False, error="trop de messages, attends un peu")
+    d = request.get_json(force=True, silent=True) or {}
+    u = (d.get("username") or "").strip()
+    p = d.get("password") or ""
+    text = (d.get("text") or "").strip()[:1000]
+    if not text:
+        return jsonify(ok=False, error="message vide")
+    with _lock:
+        db = load_db()
+        if not check(db, u, p):
+            return jsonify(ok=False, error="identifiants invalides")
+        nick = db["users"][u].get("nickname") or u
+        msgs = db.setdefault("forum", [])
+        msgs.append({"user": u, "nick": nick, "text": text, "time": now_iso()})
+        del msgs[:-500]          # on garde les 500 derniers messages
+        save_db(db)
+    return jsonify(ok=True)
+
+
+@app.post("/forum/list")
+def forum_list():
+    db = load_db()
+    return jsonify(ok=True, messages=db.get("forum", [])[-200:])
+
+
+# ============================= EXTENSIONS ================================== #
+@app.post("/admin/ext_add")
+def ext_add():
+    d = request.get_json(force=True, silent=True) or {}
+    with _lock:
+        db = load_db()
+        if not admin_ok(d, db):
+            return jsonify(ok=False, error="accès refusé")
+        name = (d.get("name") or "").strip()
+        code = d.get("code") or ""
+        if not name or not code:
+            return jsonify(ok=False, error="nom ou code manquant")
+        db.setdefault("extensions", {})[name] = {
+            "code": code, "enabled": True, "added": now_iso()}
+        save_db(db)
+    return jsonify(ok=True)
+
+
+@app.post("/admin/ext_list")
+def ext_list_admin():
+    d = request.get_json(force=True, silent=True) or {}
+    db = load_db()
+    if not admin_ok(d, db):
+        return jsonify(ok=False, error="accès refusé")
+    out = [{"name": n, "enabled": e.get("enabled", True), "added": e.get("added", "")}
+           for n, e in db.get("extensions", {}).items()]
+    return jsonify(ok=True, extensions=out)
+
+
+@app.post("/admin/ext_toggle")
+def ext_toggle():
+    d = request.get_json(force=True, silent=True) or {}
+    with _lock:
+        db = load_db()
+        if not admin_ok(d, db):
+            return jsonify(ok=False, error="accès refusé")
+        ext = db.get("extensions", {}).get(d.get("name"))
+        if not ext:
+            return jsonify(ok=False, error="introuvable")
+        ext["enabled"] = bool(d.get("enabled", True))
+        save_db(db)
+    return jsonify(ok=True)
+
+
+@app.post("/admin/ext_delete")
+def ext_delete():
+    d = request.get_json(force=True, silent=True) or {}
+    with _lock:
+        db = load_db()
+        if not admin_ok(d, db):
+            return jsonify(ok=False, error="accès refusé")
+        db.get("extensions", {}).pop(d.get("name"), None)
+        save_db(db)
+    return jsonify(ok=True)
+
+
+@app.post("/ext_enabled")
+def ext_enabled():
+    """Liste publique (pour les navigateurs) : extensions activées + leur code."""
+    db = load_db()
+    out = {n: e["code"] for n, e in db.get("extensions", {}).items() if e.get("enabled", True)}
+    return jsonify(ok=True, extensions=out)
+
+
 # --------------------- SYNCHRO avec le serveur LOCAL ----------------------- #
 @app.post("/admin/dump")
 def admin_dump():
@@ -315,7 +408,8 @@ def admin_dump():
 @app.post("/admin/merge")
 def admin_merge():
     """Fusionne une base entrante : union des comptes, on garde le plus récent.
-    Ne supprime jamais de compte -> aucune donnée perdue."""
+    Ne supprime jamais de compte -> aucune donnée perdue.
+    Fusionne aussi le forum (par heure) et les extensions."""
     d = request.get_json(force=True, silent=True) or {}
     incoming = d.get("db") or {}
     with _lock:
@@ -326,6 +420,18 @@ def admin_merge():
             cur = db["users"].get(name)
             if not cur or u.get("updated", "") > cur.get("updated", ""):
                 db["users"][name] = u
+        # forum : union des messages (dédoublonnés par user+time+text)
+        seen = {(m["user"], m["time"], m["text"]) for m in db.get("forum", [])}
+        for m in incoming.get("forum", []) or []:
+            key = (m.get("user"), m.get("time"), m.get("text"))
+            if key not in seen:
+                db.setdefault("forum", []).append(m); seen.add(key)
+        db["forum"] = sorted(db.get("forum", []), key=lambda m: m.get("time", ""))[-500:]
+        # extensions : on garde la plus récente
+        for n, e in (incoming.get("extensions", {}) or {}).items():
+            cur = db.setdefault("extensions", {}).get(n)
+            if not cur or e.get("added", "") > cur.get("added", ""):
+                db["extensions"][n] = e
         save_db(db)
         merged = db
     return jsonify(ok=True, db=merged)
