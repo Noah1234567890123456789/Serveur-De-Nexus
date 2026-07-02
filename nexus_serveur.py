@@ -38,7 +38,7 @@ from collections import defaultdict
 from flask import Flask, request, jsonify, send_file, Response
 
 # Clé maîtresse : en ligne, définis la variable d'environnement NEXUS_MASTER_KEY.
-MASTER_KEY = os.environ.get("NEXUS_MASTER_KEY", "change-moi-cle-maitre-nexus-2026")
+MASTER_KEY = "change-moi-cle-maitre-nexus-2026"
 PORT = int(os.environ.get("PORT", "8000"))   # Render fournit PORT automatiquement.
 
 BASE = os.path.dirname(os.path.abspath(__file__))
