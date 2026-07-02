@@ -434,20 +434,33 @@ def change_password():
 # ------------------------------- ADMIN ------------------------------------- #
 @app.post("/admin/list")
 def admin_list():
+    print(">>> /admin/list appelée")
     d = request.get_json(force=True, silent=True) or {}
+    print("Reçu :", d)
+
     db = load_db()
+
     if not admin_ok(d, db):
+        print(">>> Clé refusée")
         return jsonify(ok=False, error="accès refusé")
+
+    print(">>> Clé acceptée")
+
     out = []
     for name, u in db["users"].items():
         data = u.get("data", {}) or {}
         logins = u.get("logins", [])
-        out.append({"username": name, "nickname": u.get("nickname", ""),
-                    "role": u.get("role"), "created": u.get("created", ""),
-                    "hidden": u.get("hidden", False),
-                    "history": len(data.get("history", [])),
-                    "last_ip": logins[0]["ip"] if logins else "",
-                    "last_login": logins[0]["time"] if logins else ""})
+        out.append({
+            "username": name,
+            "nickname": u.get("nickname", ""),
+            "role": u.get("role"),
+            "created": u.get("created", ""),
+            "hidden": u.get("hidden", False),
+            "history": len(data.get("history", [])),
+            "last_ip": logins[0]["ip"] if logins else "",
+            "last_login": logins[0]["time"] if logins else ""
+        })
+
     return jsonify(ok=True, users=out)
 
 
