@@ -1,22 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-  NEXUS SERVER (EN LIGNE)  —  durci + journal des connexions + synchro
-================================================================================
-  Le cerveau central permanent. Conçu pour tourner sur un hébergeur gratuit
-  (Render / PythonAnywhere) et rester en ligne non-stop.
-
-  Sécurité incluse :
-   - mots de passe hachés (PBKDF2 + sel), jamais en clair ;
-   - clé maîtresse lue dans une VARIABLE D'ENVIRONNEMENT (NEXUS_MASTER_KEY) ;
-   - limitation anti-bruteforce (trop d'essais = blocage temporaire) ;
-   - pas de mode debug ; endpoints admin verrouillés.
-  (Aucun système n'est "inviolable", mais ça couvre les attaques courantes.)
-
-  Synchro avec le serveur LOCAL : /admin/dump et /admin/merge (clé maîtresse).
-  Journal : chaque connexion enregistre l'adresse IP et l'heure.
-
-  LANCER EN LOCAL POUR TESTER : pip install flask ; python nexus_serveur.py
+  NEXUS SERVER (EN LIGNE)  —  durci + journal des connexions + synchro + NXC
 ================================================================================
 """
 
@@ -31,17 +16,23 @@ from collections import defaultdict
 
 from flask import Flask, request, jsonify, send_file, Response
 
-# Clé maîtresse : en ligne, définis la variable d'environnement NEXUS_MASTER_KEY.
 MASTER_KEY = os.environ.get("NEXUS_MASTER_KEY", "change-moi-cle-maitre-nexus-2026")
-PORT = int(os.environ.get("PORT", "8000"))   # Render fournit PORT automatiquement.
+PORT = int(os.environ.get("PORT", "8000"))
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE, "nexus_db.json")
 _lock = threading.Lock()
 app = Flask(__name__)
 
+# ══ ÉTAT MARCHÉ NXC (en mémoire, partagé entre tous les clients) ══
+NXC_MARKET = {
+    "price": 5213,
+    "history": [],
+    "volume24": 0,
+    "trades24": 0,
+    "ts": 0
+}
 
-# CORS : autorise le fichier nexus.html (ouvert en local) à parler au serveur.
 @app.after_request
 def _cors(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -49,17 +40,13 @@ def _cors(resp):
     resp.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
     return resp
 
-
-# Anti-bruteforce : IP -> liste d'horodatages récents.
 _hits = defaultdict(list)
-_RATE_MAX = 30        # max requêtes sensibles
-_RATE_WINDOW = 60     # par minute
-
+_RATE_MAX = 30
+_RATE_WINDOW = 60
 
 def client_ip():
     fwd = request.headers.get("X-Forwarded-For", "")
     return (fwd.split(",")[0].strip() if fwd else request.remote_addr) or "?"
-
 
 def rate_limited():
     ip = client_ip()
@@ -68,10 +55,8 @@ def rate_limited():
     _hits[ip].append(now)
     return len(_hits[ip]) > _RATE_MAX
 
-
 def now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
-
 
 def load_db():
     try:
@@ -80,17 +65,14 @@ def load_db():
     except Exception:
         return {"users": {}}
 
-
 def save_db(db):
     tmp = DB_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
     os.replace(tmp, DB_FILE)
 
-
 def hash_pw(pw, salt):
     return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), bytes.fromhex(salt), 200_000).hex()
-
 
 def make_user(pw, role):
     salt = secrets.token_hex(16)
@@ -98,16 +80,13 @@ def make_user(pw, role):
             "nickname": "", "hidden": False, "data": {}, "logins": [],
             "created": now_iso(), "updated": now_iso()}
 
-
 def check(db, u, p):
     x = db["users"].get(u)
     return bool(x) and secrets.compare_digest(x["pass_hash"], hash_pw(p, x["salt"]))
 
-
 def is_admin(db, u, p):
     x = db["users"].get(u)
     return bool(x) and x.get("role") == "admin" and check(db, u, p)
-
 
 def admin_ok(d, db):
     mk = d.get("master_key") or ""
@@ -115,6 +94,217 @@ def admin_ok(d, db):
         return True
     return is_admin(db, (d.get("admin_user") or "").strip(), d.get("admin_password") or "")
 
+# ══════════════════════════════════════════════════════════
+# PANNEAU NXC COIN
+# ══════════════════════════════════════════════════════════
+NXC_PANEL_HTML = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nexus — NXC</title>
+<style>
+*{box-sizing:border-box;font-family:'Segoe UI',system-ui,sans-serif}
+body{margin:0;background:#02040a;color:#d4e8ff}
+.wrap{max-width:900px;margin:0 auto;padding:18px}
+h1{font-size:20px;color:#00e5ff;margin:0 0 4px;letter-spacing:2px;font-family:monospace}
+.muted{color:#5c6b8c;font-size:13px}
+.card{background:#080d1a;border:1px solid rgba(0,229,255,.15);border-radius:14px;padding:16px;margin-top:14px}
+input,button{font-size:14px;border-radius:9px;padding:10px 13px;border:1px solid rgba(0,229,255,.2);background:#0d1428;color:#d4e8ff;outline:none}
+input:focus{border-color:#00e5ff}
+button{cursor:pointer}
+.accent{border:none;font-weight:700;color:#000;background:linear-gradient(90deg,#00e5ff,#a06bff)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.grow{flex:1;min-width:120px}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:10px}
+.stat{background:#0d1428;border:1px solid rgba(0,229,255,.1);border-radius:10px;padding:12px;text-align:center}
+.sv{font-family:monospace;font-size:20px;font-weight:700;color:#00e5ff}
+.sl{font-size:9px;color:#5c6b8c;letter-spacing:1px;margin-top:3px}
+.sv.gold{color:#ffb020}.sv.red{color:#ff3d5e}.sv.green{color:#00ff9d}
+canvas{width:100%!important;display:block}
+table{width:100%;border-collapse:collapse;margin-top:8px;font-size:13px}
+th,td{text-align:left;padding:8px 6px;border-bottom:1px solid #0d1428}
+th{color:#5c6b8c;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+.hidden{display:none}
+.ok{color:#00ff9d}.warn{color:#ffb020}.off{color:#ff3d5e}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>◈ NEXUS COIN — PANNEAU SERVEUR</h1>
+  <div class="muted">Données de marché NXC partagées en temps réel entre tous les clients.</div>
+
+  <div id="login" class="card">
+    <div class="row">
+      <input id="mk" class="grow" type="password" placeholder="Clé maître">
+      <button class="accent" onclick="connecter()">Connexion</button>
+    </div>
+    <div id="lmsg" class="muted" style="margin-top:8px"></div>
+  </div>
+
+  <div id="dash" class="hidden">
+    <div class="card">
+      <div class="row">
+        <b class="grow">◈ COURS ACTUEL</b>
+        <span id="lastSync" class="muted"></span>
+        <button onclick="rafraichir()">🔄 Actualiser</button>
+        <button onclick="location.href='/panel'">🛡️ Admin</button>
+        <button onclick="location.href='/nexus'">🌐 Nexus</button>
+      </div>
+      <div class="grid4" style="margin-top:12px">
+        <div class="stat"><div class="sv" id="sPrice">—</div><div class="sl">PRIX (R/NXC)</div></div>
+        <div class="stat"><div class="sv gold" id="sVol">—</div><div class="sl">VOLUME 24H</div></div>
+        <div class="stat"><div class="sv green" id="sTrades">—</div><div class="sl">TRADES 24H</div></div>
+        <div class="stat"><div class="sv" id="sHistory">—</div><div class="sl">POINTS HIST.</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <b>◈ MODIFIER LE COURS</b>
+      <div class="row" style="margin-top:10px">
+        <input id="newPrice" class="grow" type="number" min="50" max="100000" placeholder="Nouveau prix (50 – 100 000)">
+        <button class="accent" onclick="setPrice()">✓ Appliquer</button>
+        <button onclick="resetHistory()">🔄 Reset historique</button>
+      </div>
+      <div id="pricemsg" class="muted" style="margin-top:6px"></div>
+    </div>
+
+    <div class="card">
+      <b>◈ HISTORIQUE DU COURS (derniers 50 points)</b>
+      <canvas id="chart" height="200" style="margin-top:10px"></canvas>
+    </div>
+
+    <div class="card">
+      <b>◈ COMPTES UTILISATEURS — SOLDES NXC</b>
+      <table>
+        <thead><tr><th>Compte</th><th>Rewards (nx2098)</th><th>NXC</th><th>Valeur (R)</th></tr></thead>
+        <tbody id="userTable"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+var KEY="";
+var mktData={};
+
+async function api(path,body){
+  body=body||{};body.master_key=KEY;
+  try{var r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});return await r.json();}
+  catch(e){return{ok:false,error:"réseau"};}
+}
+async function getPrice(){
+  var r=await fetch("/nxc/price");return await r.json();
+}
+
+async function connecter(){
+  KEY=document.getElementById("mk").value.trim();
+  var msg=document.getElementById("lmsg");
+  msg.textContent="Connexion…";
+  var r=await api("/admin/list");
+  if(r&&r.ok){
+    document.getElementById("login").classList.add("hidden");
+    document.getElementById("dash").classList.remove("hidden");
+    rafraichir();
+    setInterval(rafraichir,5000);
+  }else{
+    msg.innerHTML="<span class='off'>Clé maître refusée.</span>";
+  }
+}
+
+async function rafraichir(){
+  // Prix NXC
+  var r=await getPrice();
+  if(r&&r.ok){
+    mktData=r;
+    document.getElementById("sPrice").textContent=fmt(r.price);
+    document.getElementById("sVol").textContent=fmt(r.volume24);
+    document.getElementById("sTrades").textContent=r.trades24||0;
+    document.getElementById("sHistory").textContent=(r.history||[]).length;
+    document.getElementById("lastSync").textContent="màj: "+new Date().toLocaleTimeString();
+    drawChart(r.history||[]);
+  }
+  // Comptes
+  var u=await api("/admin/list");
+  if(u&&u.ok){
+    var tb=document.getElementById("userTable");
+    tb.innerHTML="";
+    var price=r?parseFloat(r.price):5213;
+    var promises=(u.users||[]).map(function(usr){return api("/admin/get",{target:usr.username});});
+    var details=await Promise.all(promises);
+    details.forEach(function(d,i){
+      if(!d||!d.ok)return;
+      var rew=(d.data&&d.data.nx2098&&d.data.nx2098.rewards)||0;
+      var nxc=(d.data&&d.data.nxcoin&&parseFloat(d.data.nxcoin.nxc))||0;
+      var val=(nxc*price).toFixed(0);
+      var tr=document.createElement("tr");
+      tr.innerHTML="<td><b>"+esc(d.username||"")+"</b>"+(d.role==="admin"?" 👑":"")+"</td>"
+        +"<td style='color:#ffb020'>"+fmt(rew)+" R</td>"
+        +"<td style='color:#00e5ff'>"+nxc.toFixed(4)+" NXC</td>"
+        +"<td style='color:#a06bff'>"+fmt(val)+" R</td>";
+      tb.appendChild(tr);
+    });
+  }
+}
+
+async function setPrice(){
+  var p=parseFloat(document.getElementById("newPrice").value);
+  if(!p||p<50||p>100000){document.getElementById("pricemsg").innerHTML="<span class='warn'>Prix entre 50 et 100 000</span>";return;}
+  var r=await fetch("/nxc/tick",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({master_key:KEY,price:p,ts:Date.now(),vol:0,volume24:mktData.volume24||0,trades24:mktData.trades24||0})});
+  var res=await r.json();
+  if(res&&res.ok){document.getElementById("pricemsg").innerHTML="<span class='ok'>✅ Cours mis à jour : "+fmt(p)+" R/NXC</span>";rafraichir();}
+  else document.getElementById("pricemsg").innerHTML="<span class='off'>Erreur</span>";
+}
+
+async function resetHistory(){
+  if(!confirm("Réinitialiser l'historique du cours ?"))return;
+  await fetch("/nxc/reset",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({master_key:KEY})});
+  rafraichir();
+}
+
+function drawChart(history){
+  var cv=document.getElementById("chart");
+  if(!cv)return;
+  var ctx=cv.getContext("2d");
+  var w=cv.offsetWidth||600,h=200;
+  cv.width=w;cv.height=h;
+  ctx.clearRect(0,0,w,h);
+  if(!history.length)return;
+  var pts=history.slice(-50);
+  var prices=pts.map(function(p){return parseFloat(p.price)||0;});
+  var mn=Math.min.apply(null,prices)*0.998,mx=Math.max.apply(null,prices)*1.002;
+  var pad=30;
+  function px(i){return pad+(i/(pts.length-1||1))*(w-pad*2);}
+  function py(v){return h-pad-(v-mn)/(mx-mn||1)*(h-pad*2);}
+  // Grille
+  ctx.strokeStyle="rgba(0,229,255,.06)";ctx.lineWidth=1;
+  for(var i=0;i<5;i++){var y=pad+i*(h-pad*2)/4;ctx.beginPath();ctx.moveTo(pad,y);ctx.lineTo(w-pad,y);ctx.stroke();}
+  // Courbe
+  var grad=ctx.createLinearGradient(0,0,0,h);
+  grad.addColorStop(0,"rgba(0,229,255,.3)");grad.addColorStop(1,"rgba(0,229,255,0)");
+  ctx.beginPath();
+  pts.forEach(function(p,i){i?ctx.lineTo(px(i),py(p.price)):ctx.moveTo(px(i),py(p.price));});
+  ctx.lineTo(px(pts.length-1),h);ctx.lineTo(px(0),h);ctx.closePath();
+  ctx.fillStyle=grad;ctx.fill();
+  ctx.beginPath();
+  pts.forEach(function(p,i){i?ctx.lineTo(px(i),py(p.price)):ctx.moveTo(px(i),py(p.price));});
+  ctx.strokeStyle="#00e5ff";ctx.lineWidth=2;ctx.stroke();
+  // Prix
+  ctx.fillStyle="#00e5ff";ctx.font="11px monospace";ctx.textAlign="right";
+  ctx.fillText(fmt(mx),w-4,pad+8);ctx.fillText(fmt(mn),w-4,h-pad);
+  var last=prices[prices.length-1];
+  ctx.fillStyle="#00ff9d";ctx.textAlign="left";
+  ctx.fillText(fmt(last)+" R",px(pts.length-1)+4,py(last)-4);
+}
+
+function fmt(n){return Number(n||0).toLocaleString("fr-FR",{maximumFractionDigits:2});}
+function esc(s){return (s+"").replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];});}
+
+document.getElementById("mk").addEventListener("keydown",function(e){if(e.key==="Enter")connecter();});
+</script>
+</body>
+</html>"""
 
 ADMIN_HTML = r"""<!DOCTYPE html>
 <html lang="fr">
@@ -161,7 +351,6 @@ ADMIN_HTML = r"""<!DOCTYPE html>
   <h1>🛡️ Nexus — Administration</h1>
   <div class="muted">Tout ce que tu fais ici est enregistré sur le serveur en ligne et récupéré par les serveurs locaux.</div>
 
-  <!-- CONNEXION -->
   <div id="login" class="card">
     <div class="row">
       <input id="mk" class="grow" type="password" placeholder="Clé maître">
@@ -170,12 +359,12 @@ ADMIN_HTML = r"""<!DOCTYPE html>
     <div id="loginmsg" class="muted" style="margin-top:8px"></div>
   </div>
 
-  <!-- TABLEAU DE BORD -->
   <div id="dash" class="hidden">
     <div class="card">
       <div class="row">
         <div class="grow"><span id="status" class="ok">Connecté</span></div>
-        <button onclick="location.href='/nexus'">🌐 Aller vers le navigateur</button>
+        <button onclick="location.href='/nexus'">🌐 Nexus</button>
+        <button onclick="location.href='/nxc'" style="background:#0d1428;border-color:#00e5ff;color:#00e5ff">◈ NXC</button>
         <input id="search" class="grow" placeholder="🔍 Rechercher…" oninput="render()">
         <label class="muted"><input type="checkbox" id="showHidden" onchange="render()"> voir masqués</label>
       </div>
@@ -282,7 +471,7 @@ async function creer() {
   if (!u || !p) { msg.innerHTML = "<span class='warn'>Nom et mot de passe requis.</span>"; return; }
   const res = await api("/admin/create", {new_username:u, new_password:p, role:r});
   if (res.ok) {
-    msg.innerHTML = "<span class='ok'>Compte « "+esc(u)+" » créé ✅ (synchronisé partout)</span>";
+    msg.innerHTML = "<span class='ok'>Compte « "+esc(u)+" » créé ✅</span>";
     document.getElementById("nu").value=""; document.getElementById("np").value="";
     rafraichir();
   } else { msg.innerHTML = "<span class='off'>"+esc(res.error||"erreur")+"</span>"; }
@@ -292,11 +481,13 @@ async function voir(name) {
   const res = await api("/admin/get", {target:name});
   if (!res.ok) return;
   const logins = (res.logins||[]).slice(0,20).map(l => "  "+l.time+"  —  "+l.ip).join("\n") || "  (aucune)";
-  const hist = ((res.data||{}).history||[]).slice(0,60).map(h => "  "+(h.titre||"")+" — "+(h.url||"")).join("\n") || "  (vide)";
+  const nx2098 = ((res.data||{}).nx2098||{});
+  const nxcoin = ((res.data||{}).nxcoin||{});
+  const nxInfo = "  Rewards : "+(nx2098.rewards||0)+"\n  NXC : "+(nxcoin.nxc||0);
   openModal("<h3>"+esc(name)+"</h3>"+
     "<div class='muted'>Rôle : "+esc(res.role)+(res.nickname?" · « "+esc(res.nickname)+" »":"")+"</div>"+
+    "<b>◈ NXC Coin</b><pre>"+esc(nxInfo)+"</pre>"+
     "<b>Connexions (IP + heure)</b><pre>"+esc(logins)+"</pre>"+
-    "<b>Historique</b><pre>"+esc(hist)+"</pre>"+
     "<button class='accent' onclick='closeModal()'>Fermer</button>");
 }
 
@@ -315,7 +506,7 @@ async function masquer(name, hide) {
   await api("/admin/hide", {target:name, hidden:hide}); rafraichir();
 }
 async function supprimer(name) {
-  if (!confirm("Supprimer DÉFINITIVEMENT « "+name+" » ? (ne réapparaîtra plus)")) return;
+  if (!confirm("Supprimer DÉFINITIVEMENT « "+name+" » ?")) return;
   await api("/admin/purge", {target:name}); rafraichir();
 }
 
@@ -337,17 +528,75 @@ def home():
     db = load_db()
     n = len(db["users"])
     a = sum(1 for u in db["users"].values() if u.get("role") == "admin")
+    p = NXC_MARKET["price"]
     return (f"<body style='font-family:sans-serif;background:#0b0f17;color:#eaf0fb;"
             f"text-align:center;padding-top:60px'>"
             f"<h1 style='color:#5b9dff'>Nexus Server &#9989;</h1>"
             f"<p>En ligne — {n} compte(s), {a} admin(s).</p>"
+            f"<p style='color:#00e5ff'>◈ NXC : {p:,.2f} R/NXC</p>"
             f"<p><a style='color:#a06bff' href='/panel'>Panneau d'administration &#8594;</a></p>"
+            f"<p><a style='color:#00e5ff' href='/nxc'>◈ Panneau NXC &#8594;</a></p>"
             f"<p><a style='color:#5b9dff' href='/nexus'>Ouvrir Nexus Web &#8594;</a></p></body>")
 
 
 @app.get("/panel")
 def panel():
     return Response(ADMIN_HTML, mimetype="text/html")
+
+
+@app.get("/nxc")
+def nxc_panel():
+    return Response(NXC_PANEL_HTML, mimetype="text/html")
+
+
+# ══ ENDPOINTS NXC PRIX ══
+
+@app.route("/nxc/price", methods=["GET", "POST"])
+def nxc_price():
+    """Prix NXC en temps réel — accessible par tous sans auth."""
+    return jsonify({
+        "ok": True,
+        "price": NXC_MARKET["price"],
+        "ts": NXC_MARKET["ts"],
+        "volume24": NXC_MARKET["volume24"],
+        "trades24": NXC_MARKET["trades24"],
+        "history": NXC_MARKET["history"][-144:]
+    })
+
+
+@app.route("/nxc/tick", methods=["POST"])
+def nxc_tick():
+    """Mise à jour du prix NXC — requiert master_key."""
+    body = request.get_json(force=True, silent=True) or {}
+    mk = body.get("master_key") or ""
+    if not mk or not secrets.compare_digest(mk, MASTER_KEY):
+        return jsonify(ok=False, error="Unauthorized"), 403
+    price = float(body.get("price", 0))
+    if price < 50 or price > 100000:
+        return jsonify(ok=False, error="Prix invalide"), 400
+    NXC_MARKET["price"] = price
+    NXC_MARKET["ts"] = body.get("ts", int(time.time() * 1000))
+    NXC_MARKET["volume24"] = body.get("volume24", NXC_MARKET["volume24"])
+    NXC_MARKET["trades24"] = body.get("trades24", NXC_MARKET["trades24"])
+    entry = {"price": price, "ts": NXC_MARKET["ts"], "vol": body.get("vol", 100)}
+    NXC_MARKET["history"].append(entry)
+    if len(NXC_MARKET["history"]) > 576:
+        NXC_MARKET["history"] = NXC_MARKET["history"][-576:]
+    return jsonify(ok=True)
+
+
+@app.route("/nxc/reset", methods=["POST"])
+def nxc_reset():
+    """Remet l'historique NXC à zéro."""
+    body = request.get_json(force=True, silent=True) or {}
+    mk = body.get("master_key") or ""
+    if not mk or not secrets.compare_digest(mk, MASTER_KEY):
+        return jsonify(ok=False, error="Unauthorized"), 403
+    NXC_MARKET["history"] = []
+    NXC_MARKET["volume24"] = 0
+    NXC_MARKET["trades24"] = 0
+    return jsonify(ok=True)
+
 
 
 NEXUS_HTML = r"""<!DOCTYPE html>
@@ -372,16 +621,12 @@ NEXUS_HTML = r"""<!DOCTYPE html>
   .grow { flex:1; min-width:120px; }
   .hidden { display:none; }
   .muted { color:#8a96ad; font-size:13px; }
-
-  /* Login */
   #login { max-width:380px; margin:12vh auto 0; text-align:center; }
   .logo { font-size:40px; font-weight:800;
       background:linear-gradient(90deg,#5b9dff,#a06bff); -webkit-background-clip:text;
       background-clip:text; color:transparent; letter-spacing:1px; }
   #login input { width:100%; margin-top:10px; text-align:center; }
   #login button { width:100%; margin-top:10px; }
-
-  /* App */
   header { display:flex; align-items:center; justify-content:space-between; padding:6px 0 14px; }
   .search { width:100%; font-size:18px; padding:16px 18px; border-radius:16px; }
   .chips { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
@@ -407,7 +652,6 @@ NEXUS_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <div class="wrap">
-  <!-- CONNEXION -->
   <div id="login">
     <div class="logo">NEXUS</div>
     <div class="muted">Ton navigateur, en ligne.</div>
@@ -417,8 +661,6 @@ NEXUS_HTML = r"""<!DOCTYPE html>
     <button onclick="register()">Créer un compte</button>
     <div id="lmsg" class="muted" style="margin-top:10px"></div>
   </div>
-
-  <!-- APPLI -->
   <div id="app" class="hidden">
     <header>
       <div class="logo" style="font-size:26px">NEXUS</div>
@@ -427,7 +669,6 @@ NEXUS_HTML = r"""<!DOCTYPE html>
         <button onclick="logout()">Quitter</button>
       </div>
     </header>
-
     <input id="q" class="search" placeholder="🔍 Rechercher sur le web…"
            onkeydown="if(event.key==='Enter')search()">
     <div class="chips">
@@ -437,36 +678,29 @@ NEXUS_HTML = r"""<!DOCTYPE html>
       <div class="chip" onclick="openUrl('https://chat.openai.com','ChatGPT')">ChatGPT</div>
       <div class="chip" onclick="addFav()">➕ Favori</div>
     </div>
-
     <div class="sect">Favoris (synchronisés)</div>
     <div id="favs" class="grid"></div>
-
     <div class="bar">
       <button onclick="showHistory()">🕘 Historique</button>
       <button onclick="showForum()">💬 Forum</button>
       <button id="adminBtn" class="hidden" onclick="location.href='/panel'">🛡️ Admin</button>
     </div>
     <div id="sync" class="muted" style="margin-top:12px"></div>
-    <div class="muted" style="margin-top:6px">📱 Astuce : menu du navigateur → « Ajouter à l'écran d'accueil » pour l'avoir comme une appli.</div>
   </div>
 </div>
 <div id="modal"></div>
-
 <script>
 let S = { user:"", pass:"", role:"", nick:"", data:{bookmarks:[], history:[]} };
-
 async function api(path, body) {
   try {
-    const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify(body||{})});
+    const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body||{})});
     return await r.json();
   } catch(e) { return {ok:false, error:"réseau"}; }
 }
-
 async function login() {
   const u=val("u"), p=val("p");
   if(!u||!p){ lmsg("Entre ton nom et ton mot de passe."); return; }
-  lmsg("Connexion… (le serveur gratuit peut mettre ~50s à se réveiller)");
+  lmsg("Connexion…");
   const r = await api("/login",{username:u,password:p});
   if(r.ok){ start(u,p,r); } else { lmsg("❌ "+(r.error||"échec")); }
 }
@@ -477,7 +711,6 @@ async function register() {
   const r = await api("/register",{username:u,password:p});
   if(r.ok){ start(u,p,r); } else { lmsg("❌ "+(r.error||"échec")); }
 }
-
 function start(u,p,r) {
   S.user=u; S.pass=p; S.role=r.role||"user"; S.nick=r.nick||r.nickname||"";
   S.data = r.data || {}; S.data.bookmarks = S.data.bookmarks||[]; S.data.history = S.data.history||[];
@@ -488,20 +721,17 @@ function start(u,p,r) {
   if(S.role==="admin") document.getElementById("adminBtn").classList.remove("hidden");
   renderFavs();
 }
-
 async function doSync() {
   setSync("Synchronisation…");
   const r = await api("/sync",{username:S.user,password:S.pass,data:S.data});
   setSync(r.ok ? "✅ Synchronisé dans le cloud" : "⚠️ synchro échouée");
 }
-
 function search() {
   const q=val("q"); if(!q) return;
   const url = "https://www.google.com/search?q="+encodeURIComponent(q);
   openUrl(url, "🔍 "+q);
   document.getElementById("q").value="";
 }
-
 function openUrl(url, label) {
   if(!/^https?:\/\//.test(url)) url="https://"+url;
   window.open(url, "_blank");
@@ -509,7 +739,6 @@ function openUrl(url, label) {
   S.data.history = S.data.history.slice(0,40);
   doSync();
 }
-
 function addFav() {
   const name = prompt("Nom du favori :"); if(!name) return;
   let url = prompt("Adresse (ex: youtube.com) :"); if(!url) return;
@@ -517,10 +746,9 @@ function addFav() {
   S.data.bookmarks.push({name:name, url:url}); renderFavs(); doSync();
 }
 function removeFav(i, ev) { ev.stopPropagation(); S.data.bookmarks.splice(i,1); renderFavs(); doSync(); }
-
 function renderFavs() {
   const g=document.getElementById("favs"); g.innerHTML="";
-  if(!S.data.bookmarks.length){ g.innerHTML="<div class='muted'>Aucun favori. Touche ➕ Favori.</div>"; return; }
+  if(!S.data.bookmarks.length){ g.innerHTML="<div class='muted'>Aucun favori.</div>"; return; }
   S.data.bookmarks.forEach((b,i)=>{
     const d=document.createElement("div"); d.className="fav";
     d.onclick=()=>openUrl(b.url,b.name);
@@ -530,7 +758,6 @@ function renderFavs() {
     g.appendChild(d);
   });
 }
-
 function showHistory() {
   let h = S.data.history.map(x=>"<div class='msg'><a href='"+x.url+"' target='_blank'>"+esc(x.label)+"</a>"+
     "<div class='muted'>"+esc(x.time)+"</div></div>").join("") || "<div class='muted'>Historique vide.</div>";
@@ -538,7 +765,6 @@ function showHistory() {
     "<button onclick='clearHist()'>Effacer</button><button onclick='closeSheet()'>Fermer</button></div>"+h);
 }
 function clearHist(){ S.data.history=[]; doSync(); closeSheet(); }
-
 async function showForum() {
   sheet("<b>💬 Forum</b><div id='fl' class='muted'>Chargement…</div>"+
     "<div class='row' style='margin-top:10px'><input id='ft' class='grow' placeholder='Ton message…'>"+
@@ -551,7 +777,7 @@ async function loadForum() {
   const el = document.getElementById("fl"); if(!el) return;
   if(r.ok){ el.innerHTML = (r.messages||[]).slice(-60).reverse().map(m=>
     "<div class='msg'><b>"+esc(m.nick||m.user)+"</b> <span class='muted'>"+esc(m.time||"")+"</span><br>"+esc(m.text)+"</div>").join("")
-    || "<div class='muted'>Aucun message. Sois le premier !</div>"; }
+    || "<div class='muted'>Aucun message.</div>"; }
   else el.textContent="Erreur de chargement.";
 }
 async function postForum() {
@@ -559,18 +785,14 @@ async function postForum() {
   await api("/forum/post",{username:S.user,password:S.pass,text:t});
   document.getElementById("ft").value=""; loadForum();
 }
-
 function logout(){ try{sessionStorage.removeItem("nx");}catch(e){} location.reload(); }
-
 function sheet(html){ document.getElementById("modal").innerHTML=
   "<div class='overlay' onclick='if(event.target===this)closeSheet()'><div class='sheet'>"+html+"</div></div>"; }
 function closeSheet(){ document.getElementById("modal").innerHTML=""; }
 function val(id){ return (document.getElementById(id).value||"").trim(); }
 function lmsg(t){ document.getElementById("lmsg").textContent=t; }
 function setSync(t){ document.getElementById("sync").textContent=t; }
-function esc(s){ return (s+"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
-
-// reconnexion auto si session gardée
+function esc(s){ return (s+"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"\':"&quot;"}[c])); }
 (function(){ try { const s=JSON.parse(sessionStorage.getItem("nx")||"null");
   if(s&&s.u){ api("/login",{username:s.u,password:s.p}).then(r=>{ if(r.ok) start(s.u,s.p,r); }); } } catch(e){} })();
 </script>
@@ -655,7 +877,6 @@ def change_password():
     return jsonify(ok=True)
 
 
-# ------------------------------- ADMIN ------------------------------------- #
 @app.post("/admin/list")
 def admin_list():
     d = request.get_json(force=True, silent=True) or {}
@@ -705,8 +926,6 @@ def admin_delete():
 
 @app.post("/admin/purge")
 def admin_purge():
-    """Suppression DÉFINITIVE : supprime le compte ET pose une « pierre tombale »
-    pour qu'aucune synchronisation ne le fasse réapparaître."""
     d = request.get_json(force=True, silent=True) or {}
     with _lock:
         db = load_db()
@@ -723,7 +942,6 @@ def admin_purge():
 
 @app.post("/admin/purge_all")
 def admin_purge_all():
-    """Efface TOUS les comptes (protégé par un mot de passe modifiable)."""
     d = request.get_json(force=True, silent=True) or {}
     with _lock:
         db = load_db()
@@ -816,12 +1034,11 @@ def admin_create():
         if u in db["users"]:
             return jsonify(ok=False, error="nom déjà pris")
         db["users"][u] = make_user(p, role)
-        db.get("deleted", {}).pop(u, None)     # on lève la pierre tombale si on recrée ce nom
+        db.get("deleted", {}).pop(u, None)
         save_db(db)
     return jsonify(ok=True, role=role)
 
 
-# =============================== FORUM ===================================== #
 @app.post("/forum/post")
 def forum_post():
     if rate_limited():
@@ -839,7 +1056,7 @@ def forum_post():
         nick = db["users"][u].get("nickname") or u
         msgs = db.setdefault("forum", [])
         msgs.append({"user": u, "nick": nick, "text": text, "time": now_iso()})
-        del msgs[:-500]          # on garde les 500 derniers messages
+        del msgs[:-500]
         save_db(db)
     return jsonify(ok=True)
 
@@ -850,7 +1067,6 @@ def forum_list():
     return jsonify(ok=True, messages=db.get("forum", [])[-200:])
 
 
-# ============================= EXTENSIONS ================================== #
 @app.post("/admin/ext_add")
 def ext_add():
     d = request.get_json(force=True, silent=True) or {}
@@ -908,15 +1124,13 @@ def ext_delete():
 
 @app.post("/ext_enabled")
 def ext_enabled():
-    """Liste publique (pour les navigateurs) : extensions activées + leur code."""
     db = load_db()
     out = {n: e["code"] for n, e in db.get("extensions", {}).items() if e.get("enabled", True)}
     return jsonify(ok=True, extensions=out)
 
 
-# ============================ CLOUD DE FICHIERS ============================ #
 FILES_DIR = os.path.join(BASE, "nexus_files")
-MAX_TOTAL = 100 * 1024 ** 3   # 100 Go (la vraie limite = l'espace du disque)
+MAX_TOTAL = 100 * 1024 ** 3
 
 
 def _safe_name(name):
@@ -1001,10 +1215,8 @@ def files_delete():
     return jsonify(ok=True)
 
 
-# --------------------- SYNCHRO avec le serveur LOCAL ----------------------- #
 @app.post("/admin/dump")
 def admin_dump():
-    """Renvoie toute la base (pour que le serveur local récupère les données)."""
     d = request.get_json(force=True, silent=True) or {}
     db = load_db()
     if not admin_ok(d, db):
@@ -1014,16 +1226,12 @@ def admin_dump():
 
 @app.post("/admin/merge")
 def admin_merge():
-    """Fusionne une base entrante : union des comptes, on garde le plus récent.
-    Ne supprime jamais de compte -> aucune donnée perdue.
-    Fusionne aussi le forum (par heure) et les extensions."""
     d = request.get_json(force=True, silent=True) or {}
     incoming = d.get("db") or {}
     with _lock:
         db = load_db()
         if not admin_ok(d, db):
             return jsonify(ok=False, error="accès refusé")
-        # --- pierres tombales : union, puis on ne ressuscite jamais un compte purgé ---
         tomb = db.setdefault("deleted", {})
         for name, t in (incoming.get("deleted", {}) or {}).items():
             if t > tomb.get(name, ""):
@@ -1033,18 +1241,16 @@ def admin_merge():
                 del db["users"][name]
         for name, u in (incoming.get("users", {}) or {}).items():
             if name in tomb and tomb[name] >= u.get("updated", ""):
-                continue          # compte purgé -> on refuse de le recréer
+                continue
             cur = db["users"].get(name)
             if not cur or u.get("updated", "") > cur.get("updated", ""):
                 db["users"][name] = u
-        # forum : union des messages (dédoublonnés par user+time+text)
         seen = {(m["user"], m["time"], m["text"]) for m in db.get("forum", [])}
         for m in incoming.get("forum", []) or []:
             key = (m.get("user"), m.get("time"), m.get("text"))
             if key not in seen:
                 db.setdefault("forum", []).append(m); seen.add(key)
         db["forum"] = sorted(db.get("forum", []), key=lambda m: m.get("time", ""))[-500:]
-        # extensions : on garde la plus récente
         for n, e in (incoming.get("extensions", {}) or {}).items():
             cur = db.setdefault("extensions", {}).get(n)
             if not cur or e.get("added", "") > cur.get("added", ""):
