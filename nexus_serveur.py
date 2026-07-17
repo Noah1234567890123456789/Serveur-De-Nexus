@@ -51,6 +51,43 @@ def _load_nxc_from_db():
 
 # Charger au démarrage (appelé après la définition des fonctions)
 
+import random as _rnd
+
+def _nxc_autotick():
+    """Le serveur fait evoluer le prix NXC tout seul, toutes les 15s."""
+    while True:
+        try:
+            time.sleep(15)
+            p = NXC_MARKET["price"]
+            sigma = 0.008 + _rnd.random() * 0.015
+            adj = (_rnd.random() - 0.48) * sigma
+            if p > 80000: adj -= 0.012
+            if p < 200: adj += 0.018
+            p = max(50.0, min(100000.0, p * (1 + adj)))
+            p = round(p * 100) / 100 if _rnd.random() > 0.03 else float(round(p))
+            NXC_MARKET["price"] = p
+            NXC_MARKET["ts"] = int(time.time() * 1000)
+            NXC_MARKET["history"].append({"price": p, "ts": NXC_MARKET["ts"],
+                                          "vol": int(_rnd.random() * 800 + 30)})
+            if len(NXC_MARKET["history"]) > 576:
+                NXC_MARKET["history"] = NXC_MARKET["history"][-576:]
+            # Persister dans la DB toutes les ~2 min (8 ticks) pour survivre aux redemarrages
+            if len(NXC_MARKET["history"]) % 8 == 0:
+                with _lock:
+                    db = load_db()
+                    noah = db.get("users", {}).get("noah")
+                    if noah is not None:
+                        noah.setdefault("data", {})["nxcoin_market"] = {
+                            "price": p, "history": NXC_MARKET["history"][-144:],
+                            "volume24": NXC_MARKET["volume24"],
+                            "trades24": NXC_MARKET["trades24"],
+                            "ts": NXC_MARKET["ts"]}
+                        save_db(db)
+        except Exception:
+            pass
+
+threading.Thread(target=_nxc_autotick, daemon=True).start()
+
 
 # Restaurer le prix NXC au démarrage (Gunicorn + local)
 try:
