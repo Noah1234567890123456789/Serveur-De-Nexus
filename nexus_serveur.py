@@ -45,7 +45,8 @@ def _load_nxc_from_db():
             NXC_MARKET["history"] = mkt.get("history", [])[-288:]
             NXC_MARKET["volume24"] = mkt.get("volume24", 0)
             NXC_MARKET["trades24"] = mkt.get("trades24", 0)
-            NXC_MARKET["ts"] = mkt.get("ts", 0)
+            # Mettre ts = maintenant pour eviter le rattrapage au redemarrage
+            NXC_MARKET["ts"] = int(time.time() * 1000)
     except Exception as e:
         pass  # Garder le prix par défaut
 
@@ -637,7 +638,8 @@ def nxc_price():
         last_ts = now_ms
     TICK_MS = 15000
     elapsed = now_ms - last_ts
-    n = min(int(elapsed // TICK_MS), 240)  # max 1h de rattrapage
+    if elapsed > 3600000: NXC_MARKET["ts"] = now_ms - TICK_MS; elapsed = TICK_MS
+    n = min(int(elapsed // TICK_MS), 10)  # max 10 ticks de rattrapage
     if n > 0:
         p = float(NXC_MARKET["price"])
         for i in range(n):
@@ -654,7 +656,7 @@ def nxc_price():
         NXC_MARKET["ts"] = last_ts + n * TICK_MS
         if len(NXC_MARKET["history"]) > 576:
             NXC_MARKET["history"] = NXC_MARKET["history"][-576:]
-        # Persister pour survivre aux redemarrages (toutes les ~8 lectures avec tick)
+        # Persister a CHAQUE tick pour survivre aux redemarrages
         try:
             with _lock:
                 db = load_db()
