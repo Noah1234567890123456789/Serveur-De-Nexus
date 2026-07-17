@@ -33,6 +33,31 @@ NXC_MARKET = {
     "ts": 0
 }
 
+def _load_nxc_from_db():
+    """Restaure le dernier prix NXC depuis la DB au démarrage du serveur."""
+    try:
+        db = load_db()
+        # Chercher dans le compte noah
+        noah = db.get("users", {}).get("noah", {})
+        mkt = noah.get("data", {}).get("nxcoin_market", {})
+        if mkt and mkt.get("price", 0) > 0:
+            NXC_MARKET["price"] = float(mkt["price"])
+            NXC_MARKET["history"] = mkt.get("history", [])[-288:]
+            NXC_MARKET["volume24"] = mkt.get("volume24", 0)
+            NXC_MARKET["trades24"] = mkt.get("trades24", 0)
+            NXC_MARKET["ts"] = mkt.get("ts", 0)
+    except Exception as e:
+        pass  # Garder le prix par défaut
+
+# Charger au démarrage (appelé après la définition des fonctions)
+
+
+# Restaurer le prix NXC au démarrage (Gunicorn + local)
+try:
+    _load_nxc_from_db()
+except Exception:
+    pass
+
 @app.after_request
 def _cors(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -1261,8 +1286,10 @@ def admin_merge():
 
 
 if __name__ == "__main__":
+    _load_nxc_from_db()
     print("=" * 54)
     print("  NEXUS SERVER (en ligne)  —  http://127.0.0.1:%d" % PORT)
     print("  Clé maître :", MASTER_KEY)
+    print("  Prix NXC restauré : %.2f R" % NXC_MARKET["price"])
     print("=" * 54)
     app.run(host="0.0.0.0", port=PORT)
