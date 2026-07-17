@@ -86,7 +86,20 @@ def _nxc_autotick():
         except Exception:
             pass
 
-threading.Thread(target=_nxc_autotick, daemon=True).start()
+_tick_started = False
+_tick_lock = threading.Lock()
+
+def _ensure_tick():
+    """Demarre le thread de tick une seule fois (marche avec Gunicorn)."""
+    global _tick_started
+    if _tick_started:
+        return
+    with _tick_lock:
+        if not _tick_started:
+            threading.Thread(target=_nxc_autotick, daemon=True).start()
+            _tick_started = True
+
+_ensure_tick()
 
 
 # Restaurer le prix NXC au démarrage (Gunicorn + local)
@@ -616,6 +629,7 @@ def nxc_panel():
 @app.route("/nxc/price", methods=["GET", "POST"])
 def nxc_price():
     """Prix NXC en temps réel — accessible par tous sans auth."""
+    _ensure_tick()
     return jsonify({
         "ok": True,
         "price": NXC_MARKET["price"],
