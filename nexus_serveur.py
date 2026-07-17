@@ -628,8 +628,47 @@ def nxc_panel():
 
 @app.route("/nxc/price", methods=["GET", "POST"])
 def nxc_price():
-    """Prix NXC en temps réel — accessible par tous sans auth."""
-    _ensure_tick()
+    """Prix NXC en temps réel. Le prix evolue AU MOMENT de la lecture
+    selon le temps ecoule — aucun thread necessaire, fiable sur Render."""
+    now_ms = int(time.time() * 1000)
+    last_ts = NXC_MARKET.get("ts") or 0
+    if last_ts <= 0:
+        NXC_MARKET["ts"] = now_ms
+        last_ts = now_ms
+    TICK_MS = 15000
+    elapsed = now_ms - last_ts
+    n = min(int(elapsed // TICK_MS), 240)  # max 1h de rattrapage
+    if n > 0:
+        p = float(NXC_MARKET["price"])
+        for i in range(n):
+            sigma = 0.008 + _rnd.random() * 0.015
+            adj = (_rnd.random() - 0.48) * sigma
+            if p > 80000: adj -= 0.012
+            if p < 200: adj += 0.018
+            p = max(50.0, min(100000.0, p * (1 + adj)))
+            p = round(p * 100) / 100 if _rnd.random() > 0.03 else float(round(p))
+            t = last_ts + (i + 1) * TICK_MS
+            NXC_MARKET["history"].append(
+                {"price": p, "ts": t, "vol": int(_rnd.random() * 800 + 30)})
+        NXC_MARKET["price"] = p
+        NXC_MARKET["ts"] = last_ts + n * TICK_MS
+        if len(NXC_MARKET["history"]) > 576:
+            NXC_MARKET["history"] = NXC_MARKET["history"][-576:]
+        # Persister pour survivre aux redemarrages (toutes les ~8 lectures avec tick)
+        try:
+            with _lock:
+                db = load_db()
+                noah = db.get("users", {}).get("noah")
+                if noah is not None:
+                    noah.setdefault("data", {})["nxcoin_market"] = {
+                        "price": NXC_MARKET["price"],
+                        "history": NXC_MARKET["history"][-144:],
+                        "volume24": NXC_MARKET["volume24"],
+                        "trades24": NXC_MARKET["trades24"],
+                        "ts": NXC_MARKET["ts"]}
+                    save_db(db)
+        except Exception:
+            pass
     return jsonify({
         "ok": True,
         "price": NXC_MARKET["price"],
