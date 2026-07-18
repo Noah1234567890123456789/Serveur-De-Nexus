@@ -533,15 +533,12 @@ def nxc_bank():
                     all_flux.append(f)
                     existing_ts.add(f.get("ts"))
             all_flux = sorted(all_flux, key=lambda x: x.get("ts", 0))[-200:]
-            # Calculer totalIn et totalOut depuis les flux (source de verite)
-            total_in = sum(f.get("amount", 0) for f in all_flux if f.get("type") == "IN")
-            total_out = sum(f.get("amount", 0) for f in all_flux if f.get("type") == "OUT")
-            nxc_emis = max(float(incoming.get("nxcEmis", 0)), float(current.get("nxcEmis", 0)))
+            # Prendre les valeurs les plus élevées (anti-perte de données)
             new_bank = {
-                "reserves": round(max(0, total_in - total_out), 2),
-                "nxcEmis": nxc_emis,
-                "totalIn": round(total_in, 2),
-                "totalOut": round(total_out, 2),
+                "reserves": round(float(incoming.get("reserves", current.get("reserves", 0))), 2),
+                "nxcEmis": round(max(float(incoming.get("nxcEmis", 0)), float(current.get("nxcEmis", 0))), 4),
+                "totalIn": round(max(float(incoming.get("totalIn", 0)), float(current.get("totalIn", 0))), 2),
+                "totalOut": round(max(float(incoming.get("totalOut", 0)), float(current.get("totalOut", 0))), 2),
                 "flux": all_flux
             }
             noah.setdefault("data", {})["nxcoin_bank"] = new_bank
