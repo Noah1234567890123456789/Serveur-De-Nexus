@@ -495,6 +495,59 @@ def nxc_tick():
     return jsonify(ok=True)
 
 
+@app.route("/nxc/bank", methods=["GET", "POST"])
+def nxc_bank():
+    """Banque NXC partagee entre tous les appareils.
+    GET : retourne bankData depuis noah.
+    POST {master_key, bank} : met a jour bankData sur noah.
+    """
+    if request.method == "GET":
+        try:
+            with _lock:
+                db = load_db()
+                noah = db.get("users", {}).get("noah", {})
+                bank = noah.get("data", {}).get("nxcoin_bank",
+                    {"reserves": 0, "nxcEmis": 0, "totalIn": 0, "totalOut": 0, "flux": []})
+            return jsonify({"ok": True, "bank": bank})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)})
+    # POST : mettre a jour
+    body = request.get_json(force=True, silent=True) or {}
+    mk = body.get("master_key") or ""
+    if not mk or not secrets.compare_digest(mk, MASTER_KEY):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 403
+    incoming = body.get("bank") or {}
+    try:
+        with _lock:
+            db = load_db()
+            noah = db.get("users", {}).get("noah")
+            if noah is None:
+                return jsonify({"ok": False, "error": "Compte noah introuvable"})
+            current = noah.get("data", {}).get("nxcoin_bank",
+                {"reserves": 0, "nxcEmis": 0, "totalIn": 0, "totalOut": 0, "flux": []})
+            # Regles anti-duplication :
+            # On prend le totalIn et totalOut les plus GRANDS (jamais additionner)
+            new_bank = {
+                "reserves": float(incoming.get("reserves", current.get("reserves", 0))),
+                "nxcEmis": float(incoming.get("nxcEmis", current.get("nxcEmis", 0))),
+                "totalIn": max(float(incoming.get("totalIn", 0)), float(current.get("totalIn", 0))),
+                "totalOut": max(float(incoming.get("totalOut", 0)), float(current.get("totalOut", 0))),
+                "flux": incoming.get("flux", current.get("flux", []))
+            }
+            # Fusionner les flux sans doublons (par timestamp)
+            existing_ts = {f.get("ts") for f in current.get("flux", [])}
+            for f in incoming.get("flux", []):
+                if f.get("ts") not in existing_ts:
+                    new_bank["flux"].append(f)
+                    existing_ts.add(f.get("ts"))
+            new_bank["flux"] = sorted(new_bank["flux"], key=lambda x: x.get("ts", 0))[-200:]
+            noah.setdefault("data", {})["nxcoin_bank"] = new_bank
+            save_db(db)
+        return jsonify({"ok": True, "bank": new_bank})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
 @app.route("/nxc/reset", methods=["POST"])
 def nxc_reset():
     """Remet l'historique NXC à zéro."""
