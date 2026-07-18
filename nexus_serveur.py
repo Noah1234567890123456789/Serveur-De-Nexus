@@ -525,22 +525,25 @@ def nxc_bank():
                 return jsonify({"ok": False, "error": "Compte noah introuvable"})
             current = noah.get("data", {}).get("nxcoin_bank",
                 {"reserves": 0, "nxcEmis": 0, "totalIn": 0, "totalOut": 0, "flux": []})
-            # Regles anti-duplication :
-            # On prend le totalIn et totalOut les plus GRANDS (jamais additionner)
-            new_bank = {
-                "reserves": float(incoming.get("reserves", current.get("reserves", 0))),
-                "nxcEmis": float(incoming.get("nxcEmis", current.get("nxcEmis", 0))),
-                "totalIn": max(float(incoming.get("totalIn", 0)), float(current.get("totalIn", 0))),
-                "totalOut": max(float(incoming.get("totalOut", 0)), float(current.get("totalOut", 0))),
-                "flux": incoming.get("flux", current.get("flux", []))
-            }
             # Fusionner les flux sans doublons (par timestamp)
-            existing_ts = {f.get("ts") for f in current.get("flux", [])}
+            all_flux = list(current.get("flux", []))
+            existing_ts = {f.get("ts") for f in all_flux}
             for f in incoming.get("flux", []):
                 if f.get("ts") not in existing_ts:
-                    new_bank["flux"].append(f)
+                    all_flux.append(f)
                     existing_ts.add(f.get("ts"))
-            new_bank["flux"] = sorted(new_bank["flux"], key=lambda x: x.get("ts", 0))[-200:]
+            all_flux = sorted(all_flux, key=lambda x: x.get("ts", 0))[-200:]
+            # Calculer totalIn et totalOut depuis les flux (source de verite)
+            total_in = sum(f.get("amount", 0) for f in all_flux if f.get("type") == "IN")
+            total_out = sum(f.get("amount", 0) for f in all_flux if f.get("type") == "OUT")
+            nxc_emis = max(float(incoming.get("nxcEmis", 0)), float(current.get("nxcEmis", 0)))
+            new_bank = {
+                "reserves": round(max(0, total_in - total_out), 2),
+                "nxcEmis": nxc_emis,
+                "totalIn": round(total_in, 2),
+                "totalOut": round(total_out, 2),
+                "flux": all_flux
+            }
             noah.setdefault("data", {})["nxcoin_bank"] = new_bank
             save_db(db)
         return jsonify({"ok": True, "bank": new_bank})
