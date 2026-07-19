@@ -229,7 +229,21 @@ def admin_give_rewards():
         users = db.get("users", {})
         if target not in users:
             return jsonify({"ok": False, "error": "Utilisateur introuvable"})
-        # Modifier directement dans db pour etre sur que save_db persiste
+        # Debiter la banque
+        noah = db.get("users", {}).get("noah", {})
+        bank = noah.get("data", {}).get("nxcoin_bank", {})
+        reserves = float(bank.get("reserves") or 0)
+        if reserves < amount:
+            return jsonify({"ok": False, "error": "Reserves bancaires insuffisantes (" + str(round(reserves,2)) + " R disponibles)"})
+        bank["reserves"] = round(reserves - amount, 2)
+        bank["totalOut"] = round(float(bank.get("totalOut") or 0) + amount, 2)
+        bank.setdefault("flux", []).append({
+            "type": "OUT", "user": "ADMIN->"+target,
+            "amount": amount, "nxc": 0,
+            "ts": int(__import__("time").time()*1000)
+        })
+        noah.setdefault("data", {})["nxcoin_bank"] = bank
+        # Crediter l utilisateur
         if "data" not in users[target]:
             users[target]["data"] = {}
         if "nx2098" not in users[target]["data"]:
@@ -242,7 +256,7 @@ def admin_give_rewards():
         users[target]["data"]["rewards"]["points"] = new_total
         db["users"] = users
         save_db(db)
-    return jsonify({"ok": True, "new_rewards": new_total})
+    return jsonify({"ok": True, "new_rewards": new_total, "bank_reserves": bank["reserves"]})
 
 
 @app.route("/admin/save-data", methods=["POST"])
