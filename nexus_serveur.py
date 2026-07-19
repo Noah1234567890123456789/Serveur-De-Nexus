@@ -226,16 +226,23 @@ def admin_give_rewards():
         return jsonify({"ok": False, "error": "Parametres invalides"})
     with _lock:
         db = load_db()
-        user = db.get("users", {}).get(target)
-        if not user:
+        users = db.get("users", {})
+        if target not in users:
             return jsonify({"ok": False, "error": "Utilisateur introuvable"})
-        udata = user.get("data", {})
-        udata.setdefault("nx2098", {})
-        udata["nx2098"]["rewards"] = round((udata["nx2098"].get("rewards") or 0) + amount, 2)
-        udata.setdefault("rewards", {})["points"] = udata["nx2098"]["rewards"]
-        user["data"] = udata
+        # Modifier directement dans db pour etre sur que save_db persiste
+        if "data" not in users[target]:
+            users[target]["data"] = {}
+        if "nx2098" not in users[target]["data"]:
+            users[target]["data"]["nx2098"] = {}
+        if "rewards" not in users[target]["data"]:
+            users[target]["data"]["rewards"] = {"points": 0}
+        current = float(users[target]["data"]["nx2098"].get("rewards") or 0)
+        new_total = round(current + amount, 2)
+        users[target]["data"]["nx2098"]["rewards"] = new_total
+        users[target]["data"]["rewards"]["points"] = new_total
+        db["users"] = users
         save_db(db)
-    return jsonify({"ok": True, "new_rewards": udata["nx2098"]["rewards"]})
+    return jsonify({"ok": True, "new_rewards": new_total})
 
 
 @app.route("/admin/save-data", methods=["POST"])
