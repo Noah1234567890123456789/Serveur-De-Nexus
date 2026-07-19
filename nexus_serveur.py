@@ -778,7 +778,23 @@ def sync():
         db = load_db()
         if not check(db, u, p):
             return jsonify(ok=False, error="identifiants invalides")
-        db["users"][u]["data"] = d.get("data", {})
+        new_data = d.get("data", {})
+        old_data = db["users"][u].get("data", {})
+        # Fusionner en gardant le MAX des rewards pour eviter ecrasement
+        old_rew = float((old_data.get("nx2098") or {}).get("rewards") or 0)
+        new_rew = float((new_data.get("nx2098") or {}).get("rewards") or 0)
+        old_pts = float((old_data.get("rewards") or {}).get("points") or 0)
+        new_pts = float((new_data.get("rewards") or {}).get("points") or 0)
+        max_rew = max(old_rew, new_rew, old_pts, new_pts)
+        # Appliquer les nouvelles donnees
+        db["users"][u]["data"] = new_data
+        # Mais forcer le MAX des rewards
+        if "nx2098" not in db["users"][u]["data"]:
+            db["users"][u]["data"]["nx2098"] = {}
+        db["users"][u]["data"]["nx2098"]["rewards"] = max_rew
+        if "rewards" not in db["users"][u]["data"]:
+            db["users"][u]["data"]["rewards"] = {}
+        db["users"][u]["data"]["rewards"]["points"] = max_rew
         db["users"][u]["updated"] = now_iso()
         save_db(db)
     return jsonify(ok=True)
