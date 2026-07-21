@@ -858,6 +858,107 @@ function esc(s){ return (s+"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">"
 </html>"""
 
 
+# ══ HISTORIQUE PRIX SERVEUR ══
+# Stocke les 500 derniers prix pour l'API
+NXC_PRICE_HISTORY = []
+NXC_PRICE_HISTORY_MAX = 500
+
+def _record_server_price(price):
+    """Enregistre le prix dans l'historique serveur."""
+    import datetime
+    NXC_PRICE_HISTORY.append({
+        "price": round(float(price), 6),
+        "ts": datetime.datetime.utcnow().isoformat() + "Z"
+    })
+    if len(NXC_PRICE_HISTORY) > NXC_PRICE_HISTORY_MAX:
+        NXC_PRICE_HISTORY.pop(0)
+
+
+@app.route("/nxc/history", methods=["GET"])
+def nxc_history():
+    """Retourne l'historique des prix serveur."""
+    try:
+        n = int(request.args.get("n", 120))
+        n = max(1, min(n, NXC_PRICE_HISTORY_MAX))
+        data = NXC_PRICE_HISTORY[-n:]
+        return jsonify({
+            "ok": True,
+            "count": len(data),
+            "history": data,
+            "current": NXC_MARKET.get("price", 0)
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/nxc/stats/extended", methods=["GET"])
+def nxc_stats_extended():
+    """Statistiques etendues du marche NXC."""
+    try:
+        import math, datetime
+        prices = [h["price"] for h in NXC_PRICE_HISTORY if h.get("price")]
+        cur = float(NXC_MARKET.get("price", 0))
+
+        # Volatilite realisee
+        vol = 0.0
+        if len(prices) > 1:
+            returns = [prices[i]/prices[i-1] - 1 for i in range(1, len(prices))]
+            mean_r  = sum(returns) / len(returns)
+            var_r   = sum((r - mean_r)**2 for r in returns) / len(returns)
+            vol     = math.sqrt(var_r) * 100
+
+        # Max drawdown
+        max_dd = 0.0
+        if prices:
+            peak = prices[0]
+            for p in prices:
+                if p > peak:
+                    peak = p
+                dd = (peak - p) / peak if peak > 0 else 0
+                if dd > max_dd:
+                    max_dd = dd
+
+        # Tendance lineaire (regression simple)
+        trend = 0.0
+        if len(prices) > 2:
+            n  = len(prices)
+            xs = list(range(n))
+            mx = sum(xs) / n
+            my = sum(prices) / n
+            num = sum((xs[i] - mx) * (prices[i] - my) for i in range(n))
+            den = sum((xs[i] - mx)**2 for i in range(n))
+            trend = (num / den) if den != 0 else 0.0
+
+        # Prix min / max / moyen
+        p_min  = min(prices) if prices else cur
+        p_max  = max(prices) if prices else cur
+        p_mean = sum(prices) / len(prices) if prices else cur
+
+        return jsonify({
+            "ok": True,
+            "current":       cur,
+            "samples":       len(prices),
+            "vol_pct":       round(vol, 4),
+            "max_drawdown":  round(max_dd * 100, 4),
+            "trend_per_tick": round(trend, 6),
+            "price_min":     round(p_min, 4),
+            "price_max":     round(p_max, 4),
+            "price_mean":    round(p_mean, 4),
+            "frozen":        NXC_FROZEN.get("active", False),
+            "vol_mult":      NXC_VOLATILITY_MULT.get("value", 1.0),
+            "fees":          NXC_FEES,
+            "timestamp":     datetime.datetime.utcnow().isoformat() + "Z"
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+def _record_price_hook(price):
+    """Hook appele par autotick pour enregistrer le prix."""
+    _record_server_price(price)
+
+
+
 @app.get("/nexus")
 def nexus_web():
     return Response(NEXUS_HTML, mimetype="text/html")
