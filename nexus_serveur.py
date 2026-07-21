@@ -1399,30 +1399,6 @@ def nxc_meanprice():
 
 
 
-@app.route("/admin/list", methods=["POST"])
-def admin_list():
-    """Liste tous les utilisateurs — utilisé pour valider la clé maître au login."""
-    body = request.get_json(force=True, silent=True) or {}
-    mk = (body.get("master_key") or request.args.get("master_key") or "")
-    if not mk or not secrets.compare_digest(mk, MASTER_KEY):
-        return jsonify({"ok": False, "error": "Unauthorized"}), 403
-    try:
-        with _lock:
-            db = load_db()
-            users_raw = db.get("users", {})
-            users = [
-                {
-                    "username": u,
-                    "role": d.get("role", "user"),
-                    "nxc": round(float(d.get("data", {}).get("nxc_balance", 0.0)), 4)
-                }
-                for u, d in users_raw.items()
-            ]
-        return jsonify({"ok": True, "users": users, "count": len(users)})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
 @app.route("/nxc/fees", methods=["GET", "POST"])
 def nxc_fees():
     """GET  : retourne les frais par rôle.
