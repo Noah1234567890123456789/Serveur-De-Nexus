@@ -1636,3 +1636,118 @@ if __name__ == "__main__":
     print("  Prix NXC restauré : %.2f R" % NXC_MARKET["price"])
     print("=" * 54)
     app.run(host="0.0.0.0", port=PORT)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ROUTES UTILITAIRES SUPPLÉMENTAIRES — statistiques avancées, audit, debug
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/nxc/stats/volatility", methods=["GET"])
+def nxc_stats_volatility():
+    """Volatilité réalisée sur N derniers ticks (annualisée et brute)."""
+    import math
+    n = min(int(request.args.get("n", 20)), 576)
+    hist = NXC_MARKET.get("history", [])
+    prices = [float(h["price"]) for h in hist[-n+1:] if h.get("price")]
+    if len(prices) < 2:
+        return jsonify({"ok": True, "vol_brute": 0, "vol_annualisee": 0, "n": 0})
+    rets = [math.log(prices[i] / prices[i-1]) for i in range(1, len(prices)) if prices[i-1] > 0]
+    if not rets:
+        return jsonify({"ok": True, "vol_brute": 0, "vol_annualisee": 0, "n": 0})
+    mu = sum(rets) / len(rets)
+    var = sum((r - mu) ** 2 for r in rets) / len(rets)
+    vol = math.sqrt(var)
+    ticks_per_year = 365 * 24 * 3600 / 8  # tick toutes les 8s
+    vol_ann = vol * math.sqrt(ticks_per_year)
+    return jsonify({
+        "ok": True,
+        "vol_brute": round(vol * 100, 4),
+        "vol_annualisee": round(vol_ann * 100, 2),
+        "n_ticks": len(rets),
+        "drift_moyen": round(mu * 100, 5),
+        "prix_actuel": NXC_MARKET["price"]
+    })
+
+
+@app.route("/nxc/stats/drawdown", methods=["GET"])
+def nxc_stats_drawdown():
+    """Max drawdown et max runup sur l'historique disponible."""
+    hist = NXC_MARKET.get("history", [])
+    prices = [float(h["price"]) for h in hist if h.get("price")]
+    if len(prices) < 2:
+        return jsonify({"ok": True, "max_drawdown_pct": 0, "max_runup_pct": 0})
+    peak = prices[0]
+    trough = prices[0]
+    max_dd = 0.0
+    max_ru = 0.0
+    running_low = prices[0]
+    for p in prices[1:]:
+        if p > peak:
+            peak = p
+        dd = (peak - p) / peak * 100
+        if dd > max_dd:
+            max_dd = dd
+        if p < running_low:
+            running_low = p
+        ru = (p - running_low) / max(running_low, 1) * 100
+        if ru > max_ru:
+            max_ru = ru
+    return jsonify({
+        "ok": True,
+        "max_drawdown_pct": round(max_dd, 2),
+        "max_runup_pct": round(max_ru, 2),
+        "prix_min": round(min(prices), 2),
+        "prix_max": round(max(prices), 2),
+        "prix_actuel": NXC_MARKET["price"],
+        "n_ticks": len(prices)
+    })
+
+
+@app.route("/nxc/stats/trend", methods=["GET"])
+def nxc_stats_trend():
+    """Tendance récente : régression linéaire sur les N derniers prix."""
+    import math
+    n = min(int(request.args.get("n", 30)), 576)
+    hist = NXC_MARKET.get("history", [])
+    prices = [float(h["price"]) for h in hist[-n:] if h.get("price")]
+    if len(prices) < 3:
+        return jsonify({"ok": True, "slope_pct_per_tick": 0, "r2": 0, "trend": "neutre"})
+    xs = list(range(len(prices)))
+    n2 = len(xs)
+    mx = sum(xs) / n2
+    my = sum(prices) / n2
+    num = sum((xs[i]-mx)*(prices[i]-my) for i in range(n2))
+    den = sum((x-mx)**2 for x in xs)
+    slope = num / den if den else 0
+    slope_pct = slope / max(prices[0], 1) * 100
+    # R²
+    ss_res = sum((prices[i] - (my + slope*(xs[i]-mx)))**2 for i in range(n2))
+    ss_tot = sum((p - my)**2 for p in prices)
+    r2 = 1 - ss_res/ss_tot if ss_tot else 0
+    trend = "hausse" if slope_pct > 0.05 else "baisse" if slope_pct < -0.05 else "neutre"
+    return jsonify({
+        "ok": True,
+        "slope_pct_per_tick": round(slope_pct, 4),
+        "r2": round(r2, 4),
+        "trend": trend,
+        "prix_debut": round(prices[0], 2),
+        "prix_fin": round(prices[-1], 2),
+        "variation_pct": round((prices[-1]-prices[0])/max(prices[0],1)*100, 2)
+    })
+
+
+@app.route("/nxc/ping", methods=["GET"])
+def nxc_ping():
+    """Health-check rapide du serveur NXC."""
+    import time as _t
+    return jsonify({
+        "ok": True,
+        "status": "en_ligne",
+        "prix": NXC_MARKET["price"],
+        "frozen": NXC_FROZEN.get("active", False),
+        "mr_enabled": NXC_MEAN_PRICE.get("enabled", False),
+        "mr_target": NXC_MEAN_PRICE.get("target", 0),
+        "bias_drift": NXC_BIAS.get("drift", 0),
+        "volatility_mult": NXC_VOLATILITY_MULT.get("value", 1.0),
+        "hist_len": len(NXC_MARKET.get("history", [])),
+        "server_time": int(_t.time() * 1000)
+    })
