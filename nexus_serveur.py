@@ -108,9 +108,16 @@ def _nxc_autotick():
             time.sleep(15)
             p = NXC_MARKET["price"]
             sigma = (0.008 + _rnd.random() * 0.015) * NXC_VOLATILITY_MULT.get("value", 1.0)
-            adj = (_rnd.random() - 0.50) * sigma
+            noise = (_rnd.random() - 0.50) * sigma
+            # Légère mean-reversion vers la cible (force 0.3% max) pour éviter la dérive infinie
+            if NXC_MEAN_PRICE.get("enabled") and NXC_MEAN_PRICE.get("target", 0) > 0:
+                target = float(NXC_MEAN_PRICE["target"])
+                mr_pull = (target - p) / max(p, 1) * 0.003  # force douce 0.3%
+            else:
+                mr_pull = 0.0
+            adj = noise + mr_pull
             if p > 80000: adj -= 0.012
-            if p < 200: adj += 0.018
+            if p < 200:   adj += 0.018
             p = max(50.0, min(100000.0, p * (1 + adj)))
             p = round(p * 100) / 100 if _rnd.random() > 0.03 else float(round(p))
             NXC_MARKET["price"] = p
@@ -159,7 +166,7 @@ except Exception:
 # Anti-dérive automatique : la mean reversion est activée dès le démarrage
 # pour neutraliser le biais haussier naturel de l'autotick (+0.02*sigma par tick).
 # L'admin peut toujours la désactiver / changer la cible depuis le panel Contrôle.
-NXC_MEAN_PRICE["enabled"] = False  # autotick neutre 0.50
+NXC_MEAN_PRICE["enabled"] = True   # mean-reversion douce (0.3%) vers la cible
 
 # ==============================================================================
 # BLOC DE CONFIGURATION AVANCÉE — options étendues du serveur NXC
@@ -427,48 +434,7 @@ def admin_pinned_sites():
 
 @app.route("/nxc/price", methods=["GET", "POST"])
 def nxc_price():
-    """Prix NXC en temps réel. Le prix evolue AU MOMENT de la lecture
-    selon le temps ecoule — aucun thread necessaire, fiable sur Render."""
-    now_ms = int(time.time() * 1000)
-    last_ts = NXC_MARKET.get("ts") or 0
-    if last_ts <= 0:
-        NXC_MARKET["ts"] = now_ms
-        last_ts = now_ms
-    TICK_MS = 15000
-    elapsed = now_ms - last_ts
-    if elapsed > 3600000: NXC_MARKET["ts"] = now_ms - TICK_MS; elapsed = TICK_MS
-    n = min(int(elapsed // TICK_MS), 10)  # max 10 ticks de rattrapage
-    if n > 0:
-        p = float(NXC_MARKET["price"])
-        for i in range(n):
-            sigma = (0.008 + _rnd.random() * 0.015) * NXC_VOLATILITY_MULT.get("value", 1.0)
-            adj = (_rnd.random() - 0.50) * sigma
-            if p > 80000: adj -= 0.012
-            if p < 200: adj += 0.018
-            p = max(50.0, min(100000.0, p * (1 + adj)))
-            p = round(p * 100) / 100 if _rnd.random() > 0.03 else float(round(p))
-            t = last_ts + (i + 1) * TICK_MS
-            NXC_MARKET["history"].append(
-                {"price": p, "ts": t, "vol": int(_rnd.random() * 800 + 30)})
-        NXC_MARKET["price"] = p
-        NXC_MARKET["ts"] = last_ts + n * TICK_MS
-        if len(NXC_MARKET["history"]) > 576:
-            NXC_MARKET["history"] = NXC_MARKET["history"][-576:]
-        # Persister a CHAQUE tick pour survivre aux redemarrages
-        try:
-            with _lock:
-                db = load_db()
-                noah = db.get("users", {}).get("noah")
-                if noah is not None:
-                    noah.setdefault("data", {})["nxcoin_market"] = {
-                        "price": NXC_MARKET["price"],
-                        "history": NXC_MARKET["history"][-144:],
-                        "volume24": NXC_MARKET["volume24"],
-                        "trades24": NXC_MARKET["trades24"],
-                        "ts": NXC_MARKET["ts"]}
-                    save_db(db)
-        except Exception:
-            pass
+    """Prix NXC actuel — le tick est géré uniquement par le thread _nxc_autotick."""
     return jsonify({
         "ok": True,
         "price": NXC_MARKET["price"],
