@@ -452,17 +452,23 @@ def nxc_price():
     if n > 0:
         p = float(NXC_MARKET["price"])
         target = float(NXC_MEAN_PRICE.get("target") or p)
+        import math as _math
+        tick_idx = len(NXC_MARKET["history"])
         for i in range(n):
             volt = NXC_VOLATILITY_MULT.get("value", 1.0)
-            sigma = (0.015 + _rnd.random() * 0.025) * volt
+            sigma = (0.018 + _rnd.random() * 0.022) * volt
+            # Bruit aléatoire symétrique — neutre
             noise = (_rnd.random() - 0.50) * sigma
-            # Mean-reversion douce (0.3%) pour éviter dérive infinie
-            mr = (target - p) / max(p, 1) * 0.003
-            # Biais directionnel si configuré
-            drift_adj = NXC_BIAS.get("drift", 0) * 0.02
-            adj = noise + mr + drift_adj
-            if p > 80000: adj -= 0.015
-            if p < 200:   adj += 0.015
+            # Oscillation sinusoïdale forcée (cycle ~20 min) — GARANTIT montée ET descente
+            cycle_period = 150  # ticks par cycle complet
+            cycle = 0.018 * _math.sin(2 * _math.pi * (tick_idx + i) / cycle_period)
+            # Mean-reversion très douce vers la cible
+            mr = (target - p) / max(p, 1) * 0.002
+            # Biais directionnel configurable
+            drift_adj = NXC_BIAS.get("drift", 0) * 0.025
+            adj = noise + cycle + mr + drift_adj
+            if p > 80000: adj -= 0.02
+            if p < 200:   adj += 0.02
             p = max(50.0, min(100000.0, p * (1 + adj)))
             p = round(p * 100) / 100
             t = last_ts + (i + 1) * TICK_MS
@@ -494,7 +500,8 @@ def nxc_price():
         "ts": NXC_MARKET["ts"],
         "volume24": NXC_MARKET["volume24"],
         "trades24": NXC_MARKET["trades24"],
-        "history": NXC_MARKET["history"][-144:]
+        "history": NXC_MARKET["history"][-144:],
+        "v": "v3-oscillation"
     })
 
 
@@ -1802,4 +1809,112 @@ def nxc_ping():
         "volatility_mult": NXC_VOLATILITY_MULT.get("value", 1.0),
         "hist_len": len(NXC_MARKET.get("history", [])),
         "server_time": int(_t.time() * 1000)
+    })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ROUTES ADMIN SUPPLÉMENTAIRES v3
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/nxc/market/info", methods=["GET"])
+def nxc_market_info():
+    """Info complètes sur le marché + paramètres actifs."""
+    import math as _m
+    hist = NXC_MARKET.get("history", [])
+    prices = [float(h["price"]) for h in hist if h.get("price")]
+    p = float(NXC_MARKET["price"])
+    tick_idx = len(hist)
+    cycle_period = 150
+    cycle_phase = (tick_idx % cycle_period) / cycle_period * 100
+    cycle_dir = "montée" if _m.sin(2*_m.pi*tick_idx/cycle_period) > 0 else "descente"
+    return jsonify({
+        "ok": True,
+        "price": p,
+        "tick_index": tick_idx,
+        "cycle_phase_pct": round(cycle_phase, 1),
+        "cycle_direction": cycle_dir,
+        "mr_enabled": NXC_MEAN_PRICE.get("enabled"),
+        "mr_target": NXC_MEAN_PRICE.get("target"),
+        "bias_drift": NXC_BIAS.get("drift"),
+        "volatility_mult": NXC_VOLATILITY_MULT.get("value"),
+        "frozen": NXC_FROZEN.get("active"),
+        "prix_min_hist": round(min(prices), 2) if prices else p,
+        "prix_max_hist": round(max(prices), 2) if prices else p,
+        "nb_ticks": tick_idx,
+        "version": "v3-oscillation"
+    })
+
+
+@app.route("/nxc/market/reset-history", methods=["POST"])
+def nxc_market_reset_history():
+    """Réinitialise l'historique des prix (garde le prix actuel)."""
+    body = request.get_json(force=True, silent=True) or {}
+    mk = body.get("master_key", "")
+    if not mk or not secrets.compare_digest(mk, MASTER_KEY):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 403
+    p = NXC_MARKET["price"]
+    ts = int(time.time() * 1000)
+    NXC_MARKET["history"] = [{"price": p, "ts": ts, "vol": 0}]
+    NXC_MARKET["ts"] = ts
+    NXC_MARKET["volume24"] = 0
+    NXC_MARKET["trades24"] = 0
+    return jsonify({"ok": True, "price": p, "message": "Historique réinitialisé"})
+
+
+@app.route("/nxc/market/simulate", methods=["POST"])
+def nxc_market_simulate():
+    """Simule N ticks et retourne la trajectoire (sans modifier le vrai prix)."""
+    body = request.get_json(force=True, silent=True) or {}
+    mk = body.get("master_key", "")
+    if not mk or not secrets.compare_digest(mk, MASTER_KEY):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 403
+    import math as _m, random as _r
+    n = min(int(body.get("n", 100)), 500)
+    p0 = float(body.get("price", NXC_MARKET["price"]))
+    target = float(body.get("target", NXC_MEAN_PRICE.get("target", p0)))
+    drift = float(body.get("drift", 0))
+    tick0 = len(NXC_MARKET["history"])
+    p = p0
+    trajectory = [round(p, 2)]
+    for i in range(n):
+        sigma = 0.018 + _r.random() * 0.022
+        noise = (_r.random() - 0.50) * sigma
+        cycle = 0.018 * _m.sin(2 * _m.pi * (tick0 + i) / 150)
+        mr = (target - p) / max(p, 1) * 0.002
+        adj = noise + cycle + mr + drift * 0.025
+        p = max(50.0, min(100000.0, p * (1 + adj)))
+        trajectory.append(round(p, 2))
+    return jsonify({
+        "ok": True,
+        "n": n,
+        "prix_depart": p0,
+        "prix_final": trajectory[-1],
+        "prix_min": round(min(trajectory), 2),
+        "prix_max": round(max(trajectory), 2),
+        "variation_pct": round((trajectory[-1] - p0) / max(p0, 1) * 100, 2),
+        "trajectory": trajectory
+    })
+
+
+@app.route("/nxc/config/summary", methods=["GET"])
+def nxc_config_summary():
+    """Résumé de toute la configuration NXC active."""
+    return jsonify({
+        "ok": True,
+        "marche": {
+            "prix": NXC_MARKET["price"],
+            "historique_ticks": len(NXC_MARKET.get("history", [])),
+            "volume24": NXC_MARKET.get("volume24", 0),
+            "gel_actif": NXC_FROZEN.get("active", False)
+        },
+        "dynamique": {
+            "biais_drift": NXC_BIAS.get("drift", 0),
+            "biais_speed": NXC_BIAS.get("speed", 1),
+            "mr_actif": NXC_MEAN_PRICE.get("enabled", False),
+            "mr_cible": NXC_MEAN_PRICE.get("target", 5000),
+            "volatilite_mult": NXC_VOLATILITY_MULT.get("value", 1),
+            "formule": "noise(±1.8-4%) + sinus(±1.8%) + mr(0.2%) + drift"
+        },
+        "frais": NXC_FEES,
+        "version": "v3-oscillation"
     })
