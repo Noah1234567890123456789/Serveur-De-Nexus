@@ -146,7 +146,9 @@ _tick_started = False
 _tick_lock = threading.Lock()
 
 def _ensure_tick():
-    """Demarre le thread de tick une seule fois (marche avec Gunicorn)."""
+    """Désactivé — tick géré par /nxc/price à la lecture."""
+    pass
+def _ensure_tick_disabled():
     global _tick_started
     if _tick_started:
         return
@@ -155,7 +157,7 @@ def _ensure_tick():
             threading.Thread(target=_nxc_autotick, daemon=True).start()
             _tick_started = True
 
-_ensure_tick()
+# _ensure_tick()  # désactivé — tick géré par /nxc/price à la lecture
 
 
 # Restaurer le prix NXC au démarrage (Gunicorn + local)
@@ -435,7 +437,57 @@ def admin_pinned_sites():
 
 @app.route("/nxc/price", methods=["GET", "POST"])
 def nxc_price():
-    """Prix NXC actuel — le tick est géré uniquement par le thread _nxc_autotick."""
+    """Prix NXC en temps réel — tick-à-la-lecture, neutre, avec légère mean-reversion."""
+    now_ms = int(time.time() * 1000)
+    last_ts = NXC_MARKET.get("ts") or 0
+    if last_ts <= 0:
+        NXC_MARKET["ts"] = now_ms
+        last_ts = now_ms
+    TICK_MS = 8000  # tick toutes les 8s
+    elapsed = now_ms - last_ts
+    if elapsed > 3600000:
+        NXC_MARKET["ts"] = now_ms - TICK_MS
+        elapsed = TICK_MS
+    n = min(int(elapsed // TICK_MS), 10)
+    if n > 0:
+        p = float(NXC_MARKET["price"])
+        target = float(NXC_MEAN_PRICE.get("target") or p)
+        for i in range(n):
+            volt = NXC_VOLATILITY_MULT.get("value", 1.0)
+            sigma = (0.015 + _rnd.random() * 0.025) * volt
+            noise = (_rnd.random() - 0.50) * sigma
+            # Mean-reversion douce (0.3%) pour éviter dérive infinie
+            mr = (target - p) / max(p, 1) * 0.003
+            # Biais directionnel si configuré
+            drift_adj = NXC_BIAS.get("drift", 0) * 0.02
+            adj = noise + mr + drift_adj
+            if p > 80000: adj -= 0.015
+            if p < 200:   adj += 0.015
+            p = max(50.0, min(100000.0, p * (1 + adj)))
+            p = round(p * 100) / 100
+            t = last_ts + (i + 1) * TICK_MS
+            NXC_MARKET["history"].append(
+                {"price": p, "ts": t, "vol": int(_rnd.random() * 500 + 50)})
+        if len(NXC_MARKET["history"]) > 576:
+            NXC_MARKET["history"] = NXC_MARKET["history"][-576:]
+        NXC_MARKET["price"] = p
+        NXC_MARKET["ts"] = last_ts + n * TICK_MS
+        # Persister périodiquement
+        if len(NXC_MARKET["history"]) % 10 == 0:
+            try:
+                with _lock:
+                    db = load_db()
+                    noah = db.get("users", {}).get("noah")
+                    if noah is not None:
+                        noah.setdefault("data", {})["nxcoin_market"] = {
+                            "price": p,
+                            "history": NXC_MARKET["history"][-144:],
+                            "volume24": NXC_MARKET["volume24"],
+                            "trades24": NXC_MARKET["trades24"],
+                            "ts": NXC_MARKET["ts"]}
+                        save_db(db)
+            except Exception:
+                pass
     return jsonify({
         "ok": True,
         "price": NXC_MARKET["price"],
