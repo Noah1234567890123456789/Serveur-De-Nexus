@@ -470,7 +470,7 @@ def nxc_price():
             NXC_MARKET["price"] = round(p, 4)
             NXC_MARKET["ts"] = now_ms
             hist = NXC_MARKET.setdefault("history", [])
-            hist.append({"t": now_ms, "p": NXC_MARKET["price"]})
+            hist.append({"price": NXC_MARKET["price"], "ts": now_ms, "vol": int(_rnd.random()*800+30)})
             if len(hist) > 500:
                 del hist[:-500]
     return jsonify({
