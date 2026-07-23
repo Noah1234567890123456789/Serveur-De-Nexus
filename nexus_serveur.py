@@ -102,38 +102,32 @@ def _load_nxc_from_db():
 import random as _rnd
 
 def _nxc_autotick():
-    """Prix NXC : random walk neutre + sinus (cycle 50 ticks ~7 min) = oscillation garantie."""
-    import math as _mth
-    _cycle_period = 50   # ticks par cycle complet — cycle court, oscillation visible
+    """Le serveur fait evoluer le prix NXC tout seul, toutes les 8s."""
     while True:
         try:
-            time.sleep(4)
+            time.sleep(8)
             p = NXC_MARKET["price"]
-            volt = NXC_VOLATILITY_MULT.get("value", 1.0)
-            sigma = (0.030 + _rnd.random() * 0.035) * volt
-            # Bruit symétrique : ni haussier ni baissier
+            # sigma plus élevé = variations visibles (+/-1.5% à +/-4% par tick)
+            sigma = (0.015 + _rnd.random() * 0.025) * NXC_VOLATILITY_MULT.get("value", 1.0)
             noise = (_rnd.random() - 0.50) * sigma
-            # Sinus forcé : GARANTIT montée ET descente — amplitude ±4.5%
-            tick_idx = len(NXC_MARKET["history"])
-            cycle = 0.045 * _mth.sin(2 * _mth.pi * tick_idx / _cycle_period)
-            # Mean-reversion douce vers la cible (0.15% max)
+            # Légère mean-reversion vers la cible (force 0.3% max) pour éviter la dérive infinie
             if NXC_MEAN_PRICE.get("enabled") and NXC_MEAN_PRICE.get("target", 0) > 0:
                 target = float(NXC_MEAN_PRICE["target"])
-                mr = (target - p) / max(p, 1) * 0.0015
+                mr_pull = (target - p) / max(p, 1) * 0.003  # force douce 0.3%
             else:
-                mr = 0.0
-            drift_adj = NXC_BIAS.get("drift", 0) * 0.025
-            adj = noise + cycle + mr + drift_adj
-            if p > 80000: adj -= 0.02
-            if p < 200:   adj += 0.02
+                mr_pull = 0.0
+            adj = noise + mr_pull
+            if p > 80000: adj -= 0.012
+            if p < 200:   adj += 0.018
             p = max(50.0, min(100000.0, p * (1 + adj)))
-            p = round(p * 100) / 100
+            p = round(p * 100) / 100 if _rnd.random() > 0.03 else float(round(p))
             NXC_MARKET["price"] = p
             NXC_MARKET["ts"] = int(time.time() * 1000)
             NXC_MARKET["history"].append({"price": p, "ts": NXC_MARKET["ts"],
                                           "vol": int(_rnd.random() * 800 + 30)})
             if len(NXC_MARKET["history"]) > 576:
                 NXC_MARKET["history"] = NXC_MARKET["history"][-576:]
+            # Persister dans la DB toutes les ~2 min (8 ticks) pour survivre aux redemarrages
             if len(NXC_MARKET["history"]) % 8 == 0:
                 with _lock:
                     db = load_db()
@@ -152,7 +146,9 @@ _tick_started = False
 _tick_lock = threading.Lock()
 
 def _ensure_tick():
-    """Démarre le thread de prix NXC si pas encore démarré."""
+    """Désactivé — tick géré par /nxc/price à la lecture."""
+    pass
+def _ensure_tick_disabled():
     global _tick_started
     if _tick_started:
         return
@@ -161,7 +157,7 @@ def _ensure_tick():
             threading.Thread(target=_nxc_autotick, daemon=True).start()
             _tick_started = True
 
-_ensure_tick()  # démarrer le thread au lancement du serveur
+# _ensure_tick()  # désactivé — tick géré par /nxc/price à la lecture
 
 
 # Restaurer le prix NXC au démarrage (Gunicorn + local)
@@ -447,8 +443,57 @@ def nxc_price():
     if last_ts <= 0:
         NXC_MARKET["ts"] = now_ms
         last_ts = now_ms
-    # Le thread _nxc_autotick gère le prix — ici on lit seulement
-    pass
+    TICK_MS = 8000  # tick toutes les 8s
+    elapsed = now_ms - last_ts
+    if elapsed > 3600000:
+        NXC_MARKET["ts"] = now_ms - TICK_MS
+        elapsed = TICK_MS
+    n = min(int(elapsed // TICK_MS), 10)
+    if n > 0:
+        p = float(NXC_MARKET["price"])
+        target = float(NXC_MEAN_PRICE.get("target") or p)
+        import math as _math
+        tick_idx = len(NXC_MARKET["history"])
+        for i in range(n):
+            volt = NXC_VOLATILITY_MULT.get("value", 1.0)
+            sigma = (0.018 + _rnd.random() * 0.022) * volt
+            # Bruit aléatoire symétrique — neutre
+            noise = (_rnd.random() - 0.50) * sigma
+            # Oscillation sinusoïdale forcée (cycle ~20 min) — GARANTIT montée ET descente
+            cycle_period = 150  # ticks par cycle complet
+            cycle = 0.018 * _math.sin(2 * _math.pi * (tick_idx + i) / cycle_period)
+            # Mean-reversion très douce vers la cible
+            mr = (target - p) / max(p, 1) * 0.002
+            # Biais directionnel configurable
+            drift_adj = NXC_BIAS.get("drift", 0) * 0.025
+            adj = noise + cycle + mr + drift_adj
+            if p > 80000: adj -= 0.02
+            if p < 200:   adj += 0.02
+            p = max(50.0, min(100000.0, p * (1 + adj)))
+            p = round(p * 100) / 100
+            t = last_ts + (i + 1) * TICK_MS
+            NXC_MARKET["history"].append(
+                {"price": p, "ts": t, "vol": int(_rnd.random() * 500 + 50)})
+        if len(NXC_MARKET["history"]) > 576:
+            NXC_MARKET["history"] = NXC_MARKET["history"][-576:]
+        NXC_MARKET["price"] = p
+        NXC_MARKET["ts"] = last_ts + n * TICK_MS
+        # Persister périodiquement
+        if len(NXC_MARKET["history"]) % 10 == 0:
+            try:
+                with _lock:
+                    db = load_db()
+                    noah = db.get("users", {}).get("noah")
+                    if noah is not None:
+                        noah.setdefault("data", {})["nxcoin_market"] = {
+                            "price": p,
+                            "history": NXC_MARKET["history"][-144:],
+                            "volume24": NXC_MARKET["volume24"],
+                            "trades24": NXC_MARKET["trades24"],
+                            "ts": NXC_MARKET["ts"]}
+                        save_db(db)
+            except Exception:
+                pass
     return jsonify({
         "ok": True,
         "price": NXC_MARKET["price"],
@@ -1400,15 +1445,7 @@ def admin_merge():
                 continue
             cur = db["users"].get(name)
             if not cur or u.get("updated", "") > cur.get("updated", ""):
-                if cur:
-                    merged = dict(cur)
-                    merged.update({k: v for k, v in u.items() if k not in ("ok", "username")})
-                    for f in ("password",):
-                        if f in cur and f not in u:
-                            merged[f] = cur[f]
-                    db["users"][name] = merged
-                else:
-                    db["users"][name] = u
+                db["users"][name] = u
         seen = {(m["user"], m["time"], m["text"]) for m in db.get("forum", [])}
         for m in incoming.get("forum", []) or []:
             key = (m.get("user"), m.get("time"), m.get("text"))
