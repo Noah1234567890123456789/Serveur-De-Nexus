@@ -2188,3 +2188,424 @@ def nxc_config_summary():
         "frais": NXC_FEES,
         "version": "v3-oscillation"
     })
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  NEXUS EXCHANGE  —  Marché boursier simulé multijoueur
+#  Portfolios · Order Book · Matching Engine · Bots · Events · Classement · Badges
+# ════════════════════════════════════════════════════════════════════════════════
+
+import math as _exmath
+import uuid as _uuid
+
+# ── Données Exchange (en mémoire) ─────────────────────────────────────────────
+NXC_EX = {
+    "portfolios": {},   # username -> {nxd, nxc, open_orders, trades, badges, joined}
+    "orders":     [],   # limit orders actifs: {id, user, side, price, qty, ts}
+    "trades":     [],   # trades exécutés (max 500)
+    "events":     [],   # événements de marché (max 50)
+    "candles":    [],   # bougies OHLC (max 200)
+}
+_EX_LOCK = threading.Lock()
+
+# Frais de transaction (0.5%)
+_EX_FEE = 0.005
+
+# ── Bots traders ──────────────────────────────────────────────────────────────
+_EX_BOTS = [
+    {"name": "🤖 AlphaBot",  "nxd": 80000.0, "nxc": 500.0,  "style": "aggressive"},
+    {"name": "🛡️ SafeBot",   "nxd": 60000.0, "nxc": 300.0,  "style": "conservative"},
+    {"name": "📈 SwingBot",  "nxd": 50000.0, "nxc": 200.0,  "style": "swing"},
+    {"name": "🎲 ChaosBot",  "nxd": 40000.0, "nxc": 150.0,  "style": "chaos"},
+]
+
+def _ex_save():
+    """Persiste l'exchange dans la DB."""
+    try:
+        db = load_db()
+        db.setdefault("exchange", {})
+        db["exchange"]["portfolios"] = NXC_EX["portfolios"]
+        db["exchange"]["trades"]     = NXC_EX["trades"][-200:]
+        db["exchange"]["events"]     = NXC_EX["events"][-50:]
+        save_db(db)
+    except Exception as e:
+        print(f"[EX] save error: {e}")
+
+def _ex_load():
+    """Charge l'exchange depuis la DB."""
+    try:
+        db = load_db()
+        ex = db.get("exchange", {})
+        if ex.get("portfolios"):
+            NXC_EX["portfolios"] = ex["portfolios"]
+        if ex.get("trades"):
+            NXC_EX["trades"] = ex["trades"]
+        if ex.get("events"):
+            NXC_EX["events"] = ex["events"]
+        # Initialise les bots dans les portfolios
+        for bot in _EX_BOTS:
+            n = bot["name"]
+            if n not in NXC_EX["portfolios"]:
+                NXC_EX["portfolios"][n] = {
+                    "nxd": bot["nxd"], "nxc": bot["nxc"],
+                    "open_orders": [], "trades": [], "badges": [], "joined": now_iso(), "is_bot": True
+                }
+    except Exception as e:
+        print(f"[EX] load error: {e}")
+
+def _check_badges(username):
+    """Attribue des badges selon les performances."""
+    p = NXC_EX["portfolios"].get(username)
+    if not p: return
+    badges = set(p.get("badges", []))
+    trades = p.get("trades", [])
+    nxc_price = NXC_MARKET.get("price", 5000)
+    total_val = p["nxd"] + p["nxc"] * nxc_price
+    if len(trades) >= 1:    badges.add("🏆 Premier Trade")
+    if len(trades) >= 10:   badges.add("📊 Trader Actif")
+    if len(trades) >= 50:   badges.add("⚡ Trader Pro")
+    if len(trades) >= 100:  badges.add("🔥 Trader Légendaire")
+    if total_val >= 20000:  badges.add("💰 Riche")
+    if total_val >= 50000:  badges.add("💎 Millionnaire NXD")
+    if total_val >= 100000: badges.add("👑 Nexus King")
+    if p["nxc"] >= 1000:    badges.add("🪙 Whale NXC")
+    if p["nxc"] == 0 and len(trades) > 0: badges.add("💸 Tout vendu")
+    p["badges"] = list(badges)
+
+def _execute_trade(buyer, seller, price, qty, source="limit"):
+    """Exécute un trade entre buyer et seller."""
+    cost = price * qty
+    fee_buyer  = cost * _EX_FEE
+    fee_seller = cost * _EX_FEE
+    bp = NXC_EX["portfolios"].get(buyer)
+    sp = NXC_EX["portfolios"].get(seller)
+    if not bp or not sp: return False
+    if bp["nxd"] < cost + fee_buyer: return False
+    if sp["nxc"] < qty: return False
+    bp["nxd"] -= cost + fee_buyer
+    bp["nxc"] += qty
+    sp["nxd"] += cost - fee_seller
+    sp["nxc"] -= qty
+    ts = int(time.time() * 1000)
+    trade = {"id": str(_uuid.uuid4())[:8], "buyer": buyer, "seller": seller,
+             "price": round(price, 4), "qty": round(qty, 6),
+             "total": round(cost, 2), "ts": ts, "source": source}
+    NXC_EX["trades"].append(trade)
+    if len(NXC_EX["trades"]) > 500: NXC_EX["trades"] = NXC_EX["trades"][-500:]
+    bp.setdefault("trades", []).append(trade)
+    sp.setdefault("trades", []).append(trade)
+    _check_badges(buyer)
+    _check_badges(seller)
+    return True
+
+def _match_orders():
+    """Matching engine : apparie les ordres d'achat et de vente."""
+    buys  = sorted([o for o in NXC_EX["orders"] if o["side"] == "buy"],
+                   key=lambda x: -x["price"])
+    sells = sorted([o for o in NXC_EX["orders"] if o["side"] == "sell"],
+                   key=lambda x: x["price"])
+    matched_ids = set()
+    for buy in buys:
+        for sell in sells:
+            if sell["id"] in matched_ids or buy["id"] in matched_ids: continue
+            if buy["user"] == sell["user"]: continue
+            if buy["price"] >= sell["price"]:
+                exec_price = (buy["price"] + sell["price"]) / 2
+                exec_qty   = min(buy["qty"], sell["qty"])
+                if _execute_trade(buy["user"], sell["user"], exec_price, exec_qty, "limit"):
+                    buy["qty"]  -= exec_qty
+                    sell["qty"] -= exec_qty
+                    if buy["qty"]  <= 0.0001: matched_ids.add(buy["id"])
+                    if sell["qty"] <= 0.0001: matched_ids.add(sell["id"])
+    NXC_EX["orders"] = [o for o in NXC_EX["orders"] if o["id"] not in matched_ids and o["qty"] > 0.0001]
+
+def _update_candles():
+    """Met à jour les bougies OHLC toutes les 30s."""
+    p = NXC_MARKET.get("price", 0)
+    ts = int(time.time())
+    period = 30
+    bucket = (ts // period) * period * 1000
+    candles = NXC_EX["candles"]
+    if candles and candles[-1]["t"] == bucket:
+        c = candles[-1]
+        c["h"] = max(c["h"], p)
+        c["l"] = min(c["l"], p)
+        c["c"] = p
+        c["v"] = c.get("v", 0) + _rnd.random() * 200
+    else:
+        prev_close = candles[-1]["c"] if candles else p
+        candles.append({"t": bucket, "o": prev_close, "h": max(prev_close, p),
+                         "l": min(prev_close, p), "c": p, "v": _rnd.random() * 500 + 50})
+        if len(candles) > 200: NXC_EX["candles"] = candles[-200:]
+
+def _bot_tick():
+    """Bots placent des ordres basés sur le marché."""
+    while True:
+        try:
+            time.sleep(_rnd.uniform(8, 20))
+            with _EX_LOCK:
+                price = NXC_MARKET.get("price", 5000)
+                _update_candles()
+                for bot in _EX_BOTS:
+                    bp = NXC_EX["portfolios"].get(bot["name"])
+                    if not bp: continue
+                    style = bot["style"]
+                    spread = 0.02 if style == "aggressive" else 0.005 if style == "conservative" else 0.01
+                    action = _rnd.choice(["buy", "sell", "none", "none"])
+                    if style == "chaos": action = _rnd.choice(["buy", "sell"])
+                    if action == "buy" and bp["nxd"] > 500:
+                        bid = round(price * (1 - spread * _rnd.random()), 2)
+                        qty = round(_rnd.uniform(0.1, min(5.0, bp["nxd"] / max(bid, 1))), 4)
+                        if qty > 0 and bid > 0:
+                            order = {"id": str(_uuid.uuid4())[:8], "user": bot["name"],
+                                     "side": "buy", "price": bid, "qty": qty,
+                                     "ts": int(time.time() * 1000)}
+                            NXC_EX["orders"].append(order)
+                    elif action == "sell" and bp["nxc"] > 0.1:
+                        ask = round(price * (1 + spread * _rnd.random()), 2)
+                        qty = round(_rnd.uniform(0.05, min(2.0, bp["nxc"])), 4)
+                        if qty > 0:
+                            order = {"id": str(_uuid.uuid4())[:8], "user": bot["name"],
+                                     "side": "sell", "price": ask, "qty": qty,
+                                     "ts": int(time.time() * 1000)}
+                            NXC_EX["orders"].append(order)
+                    # Nettoyage vieux ordres bots (>2min)
+                    now_ms = int(time.time() * 1000)
+                    NXC_EX["orders"] = [o for o in NXC_EX["orders"]
+                                        if not (o["user"] == bot["name"] and now_ms - o["ts"] > 120000)]
+                # Market orders auto entre bots (exécution directe)
+                for bot in _EX_BOTS:
+                    bp = NXC_EX["portfolios"].get(bot["name"])
+                    if not bp: continue
+                    if _rnd.random() < 0.3:
+                        sellers = [b for b in _EX_BOTS if b["name"] != bot["name"] and
+                                   NXC_EX["portfolios"].get(b["name"], {}).get("nxc", 0) > 0.5]
+                        if sellers and bp["nxd"] > 200:
+                            seller = _rnd.choice(sellers)
+                            sp = NXC_EX["portfolios"][seller["name"]]
+                            exec_price = round(price * (1 + (_rnd.random() - 0.5) * 0.01), 2)
+                            qty = round(_rnd.uniform(0.05, min(1.0, sp["nxc"], bp["nxd"] / max(exec_price, 1))), 4)
+                            if qty > 0.01:
+                                _execute_trade(bot["name"], seller["name"], exec_price, qty, "market-bot")
+                _match_orders()
+                if _rnd.random() < 0.1:
+                    _ex_save()
+        except Exception as e:
+            print(f"[BOT] error: {e}")
+
+threading.Thread(target=_bot_tick, daemon=True).start()
+_ex_load()
+
+# ── Routes Exchange ────────────────────────────────────────────────────────────
+
+@app.route("/exchange/state", methods=["GET"])
+def exchange_state():
+    """État complet du marché : prix, order book, classement, candles, events."""
+    with _EX_LOCK:
+        price = NXC_MARKET.get("price", 5000)
+        buys  = sorted([o for o in NXC_EX["orders"] if o["side"] == "buy"],
+                       key=lambda x: -x["price"])[:20]
+        sells = sorted([o for o in NXC_EX["orders"] if o["side"] == "sell"],
+                       key=lambda x: x["price"])[:20]
+        # Classement
+        leaderboard = []
+        for name, p in NXC_EX["portfolios"].items():
+            total = round(p["nxd"] + p["nxc"] * price, 2)
+            leaderboard.append({"name": name, "total": total, "nxd": round(p["nxd"], 2),
+                                 "nxc": round(p["nxc"], 6), "badges": p.get("badges", []),
+                                 "is_bot": p.get("is_bot", False), "trades": len(p.get("trades", []))})
+        leaderboard.sort(key=lambda x: -x["total"])
+        return jsonify({
+            "ok": True,
+            "price": price,
+            "bids": [{"price": o["price"], "qty": round(o["qty"], 4), "user": o["user"]} for o in buys],
+            "asks": [{"price": o["price"], "qty": round(o["qty"], 4), "user": o["user"]} for o in sells],
+            "trades": NXC_EX["trades"][-30:][::-1],
+            "candles": NXC_EX["candles"][-100:],
+            "events":  NXC_EX["events"][-10:][::-1],
+            "leaderboard": leaderboard[:20],
+            "total_users": len(NXC_EX["portfolios"]),
+        })
+
+@app.route("/exchange/portfolio/<username>", methods=["GET"])
+def exchange_portfolio(username):
+    """Portfolio d'un utilisateur."""
+    with _EX_LOCK:
+        p = NXC_EX["portfolios"].get(username)
+        if not p:
+            return jsonify({"ok": False, "error": "Compte non trouvé dans l'exchange"}), 404
+        price = NXC_MARKET.get("price", 5000)
+        my_orders = [o for o in NXC_EX["orders"] if o["user"] == username]
+        return jsonify({
+            "ok": True,
+            "username": username,
+            "nxd": round(p["nxd"], 2),
+            "nxc": round(p["nxc"], 6),
+            "total_value": round(p["nxd"] + p["nxc"] * price, 2),
+            "open_orders": my_orders,
+            "trades": p.get("trades", [])[-50:][::-1],
+            "badges": p.get("badges", []),
+            "joined": p.get("joined", ""),
+        })
+
+@app.route("/exchange/join", methods=["POST"])
+def exchange_join():
+    """Rejoint l'exchange avec un compte Nexus existant."""
+    body = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip()
+    password = (body.get("password") or "").strip()
+    if not username or not password:
+        return jsonify({"ok": False, "error": "Identifiants manquants"}), 400
+    db = load_db()
+    if not check(db, username, password):
+        return jsonify({"ok": False, "error": "Identifiants incorrects"}), 403
+    with _EX_LOCK:
+        if username not in NXC_EX["portfolios"]:
+            NXC_EX["portfolios"][username] = {
+                "nxd": 10000.0, "nxc": 0.0,
+                "open_orders": [], "trades": [], "badges": ["🎉 Bienvenue"],
+                "joined": now_iso(), "is_bot": False
+            }
+            _ex_save()
+            return jsonify({"ok": True, "new": True, "bonus_nxd": 10000})
+        return jsonify({"ok": True, "new": False})
+
+@app.route("/exchange/order", methods=["POST"])
+def exchange_order():
+    """Place un ordre d'achat ou de vente."""
+    body = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip()
+    password = (body.get("password") or "").strip()
+    side     = (body.get("side") or "").strip()       # "buy" | "sell"
+    order_type = body.get("type", "limit")            # "limit" | "market"
+    try:
+        price = float(body.get("price", 0))
+        qty   = float(body.get("qty", 0))
+    except Exception:
+        return jsonify({"ok": False, "error": "Prix/quantité invalides"}), 400
+    if side not in ("buy", "sell"): return jsonify({"ok": False, "error": "Side invalide"}), 400
+    if qty <= 0: return jsonify({"ok": False, "error": "Quantité doit être > 0"}), 400
+    db = load_db()
+    if not check(db, username, password):
+        return jsonify({"ok": False, "error": "Identifiants incorrects"}), 403
+    with _EX_LOCK:
+        p = NXC_EX["portfolios"].get(username)
+        if not p: return jsonify({"ok": False, "error": "Rejoins l'exchange d'abord"}), 400
+        mkt_price = NXC_MARKET.get("price", 5000)
+        if order_type == "market":
+            # Exécution immédiate au prix du marché
+            exec_price = mkt_price * (1.005 if side == "buy" else 0.995)
+            if side == "buy":
+                cost = exec_price * qty * (1 + _EX_FEE)
+                if p["nxd"] < cost:
+                    return jsonify({"ok": False, "error": f"NXD insuffisants (besoin: {cost:.2f})"}), 400
+                # Cherche un vendeur parmi les bots
+                sellers = [b for b in _EX_BOTS if NXC_EX["portfolios"].get(b["name"], {}).get("nxc", 0) >= qty]
+                if sellers:
+                    seller = _rnd.choice(sellers)
+                    _execute_trade(username, seller["name"], exec_price, qty, "market")
+                else:
+                    # Exécution directe contre le marché
+                    fee = exec_price * qty * _EX_FEE
+                    p["nxd"] -= exec_price * qty + fee
+                    p["nxc"] += qty
+                    ts = int(time.time() * 1000)
+                    trade = {"id": str(_uuid.uuid4())[:8], "buyer": username, "seller": "🏦 Market",
+                             "price": round(exec_price, 4), "qty": round(qty, 6),
+                             "total": round(exec_price * qty, 2), "ts": ts, "source": "market"}
+                    NXC_EX["trades"].append(trade)
+                    p.setdefault("trades", []).append(trade)
+                    _check_badges(username)
+            else:  # sell
+                if p["nxc"] < qty:
+                    return jsonify({"ok": False, "error": f"NXC insuffisants (tu as: {p['nxc']:.4f})"}), 400
+                fee = exec_price * qty * _EX_FEE
+                p["nxc"] -= qty
+                p["nxd"] += exec_price * qty - fee
+                ts = int(time.time() * 1000)
+                trade = {"id": str(_uuid.uuid4())[:8], "buyer": "🏦 Market", "seller": username,
+                         "price": round(exec_price, 4), "qty": round(qty, 6),
+                         "total": round(exec_price * qty, 2), "ts": ts, "source": "market"}
+                NXC_EX["trades"].append(trade)
+                p.setdefault("trades", []).append(trade)
+                _check_badges(username)
+            _ex_save()
+            return jsonify({"ok": True, "executed": True, "price": round(exec_price, 2), "qty": qty})
+        else:
+            # Ordre limite
+            if price <= 0: return jsonify({"ok": False, "error": "Prix limite invalide"}), 400
+            if side == "buy":
+                cost = price * qty * (1 + _EX_FEE)
+                if p["nxd"] < cost:
+                    return jsonify({"ok": False, "error": f"NXD insuffisants (besoin: {cost:.2f})"}), 400
+            else:
+                if p["nxc"] < qty:
+                    return jsonify({"ok": False, "error": f"NXC insuffisants (tu as: {p['nxc']:.4f})"}), 400
+            order = {"id": str(_uuid.uuid4())[:8], "user": username, "side": side,
+                     "price": round(price, 4), "qty": round(qty, 6), "ts": int(time.time() * 1000)}
+            NXC_EX["orders"].append(order)
+            _match_orders()
+            _ex_save()
+            return jsonify({"ok": True, "executed": False, "order_id": order["id"]})
+
+@app.route("/exchange/order/<order_id>", methods=["DELETE"])
+def exchange_cancel_order(order_id):
+    """Annule un ordre limite."""
+    body = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip()
+    password = (body.get("password") or "").strip()
+    db = load_db()
+    if not check(db, username, password):
+        return jsonify({"ok": False, "error": "Identifiants incorrects"}), 403
+    with _EX_LOCK:
+        before = len(NXC_EX["orders"])
+        NXC_EX["orders"] = [o for o in NXC_EX["orders"]
+                             if not (o["id"] == order_id and o["user"] == username)]
+        if len(NXC_EX["orders"]) < before:
+            return jsonify({"ok": True})
+        return jsonify({"ok": False, "error": "Ordre non trouvé"}), 404
+
+@app.route("/exchange/event", methods=["POST"])
+def exchange_event():
+    """Admin : déclenche un événement de marché."""
+    body = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip()
+    password = (body.get("password") or "").strip()
+    db = load_db()
+    if not is_admin(db, username, password):
+        return jsonify({"ok": False, "error": "Admin requis"}), 403
+    title   = body.get("title", "Événement")
+    desc    = body.get("desc", "")
+    impact  = float(body.get("impact", 0))  # -0.3 à +0.3 (variation prix)
+    with _EX_LOCK:
+        ev = {"id": str(_uuid.uuid4())[:8], "title": title, "desc": desc,
+              "impact": impact, "ts": int(time.time() * 1000)}
+        NXC_EX["events"].append(ev)
+        if len(NXC_EX["events"]) > 50: NXC_EX["events"] = NXC_EX["events"][-50:]
+        # Applique l'impact sur le prix
+        if impact != 0:
+            NXC_MARKET["price"] = max(1, NXC_MARKET["price"] * (1 + impact))
+    return jsonify({"ok": True, "event": ev})
+
+@app.route("/exchange/deposit", methods=["POST"])
+def exchange_deposit():
+    """Admin : donne des NXD ou NXC à un compte."""
+    body = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip()
+    password = (body.get("password") or "").strip()
+    target   = (body.get("target") or "").strip()
+    nxd      = float(body.get("nxd", 0))
+    nxc      = float(body.get("nxc", 0))
+    db = load_db()
+    if not is_admin(db, username, password):
+        return jsonify({"ok": False, "error": "Admin requis"}), 403
+    with _EX_LOCK:
+        p = NXC_EX["portfolios"].get(target)
+        if not p: return jsonify({"ok": False, "error": "Compte non trouvé"}), 404
+        p["nxd"] += nxd
+        p["nxc"] += nxc
+        _check_badges(target)
+        _ex_save()
+    return jsonify({"ok": True, "target": target, "nxd_added": nxd, "nxc_added": nxc})
+
+# ── Fin NEXUS EXCHANGE ────────────────────────────────────────────────────────
