@@ -1702,7 +1702,7 @@ def nxc_ping():
 
 # ── Historique de prix (export JSON) ──
 @app.get("/nxc/history")
-def nxc_history():
+def nxc_history_export():
     with _lock:
         hist = list(_price_hist)
     return jsonify(ok=True, history=hist, count=len(hist))
@@ -1928,7 +1928,7 @@ def nxc_stats_trend():
 
 
 @app.route("/nxc/ping", methods=["GET"])
-def nxc_ping():
+def nxc_ping_ext():
     """Health-check rapide du serveur NXC."""
     import time as _t
     return jsonify({
