@@ -107,15 +107,15 @@ def _nxc_autotick():
     _cycle_period = 50   # ticks par cycle complet — cycle court, oscillation visible
     while True:
         try:
-            time.sleep(8)
+            time.sleep(4)
             p = NXC_MARKET["price"]
             volt = NXC_VOLATILITY_MULT.get("value", 1.0)
-            sigma = (0.018 + _rnd.random() * 0.022) * volt
+            sigma = (0.030 + _rnd.random() * 0.035) * volt
             # Bruit symétrique : ni haussier ni baissier
             noise = (_rnd.random() - 0.50) * sigma
-            # Sinus forcé : GARANTIT montée ET descente — amplitude ±2.5%
+            # Sinus forcé : GARANTIT montée ET descente — amplitude ±4.5%
             tick_idx = len(NXC_MARKET["history"])
-            cycle = 0.025 * _mth.sin(2 * _mth.pi * tick_idx / _cycle_period)
+            cycle = 0.045 * _mth.sin(2 * _mth.pi * tick_idx / _cycle_period)
             # Mean-reversion douce vers la cible (0.15% max)
             if NXC_MEAN_PRICE.get("enabled") and NXC_MEAN_PRICE.get("target", 0) > 0:
                 target = float(NXC_MEAN_PRICE["target"])
