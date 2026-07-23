@@ -20,7 +20,9 @@ MASTER_KEY = os.environ.get("NEXUS_MASTER_KEY", "change-moi-cle-maitre-nexus-202
 PORT = int(os.environ.get("PORT", "8000"))
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-DB_FILE = os.path.join(BASE, "nexus_db.json")
+# Utilise /data si disponible (disque persistant Render), sinon dossier local
+_DATA_DIR = "/data" if os.path.isdir("/data") else BASE
+DB_FILE = os.path.join(_DATA_DIR, "nexus_db.json")
 _lock = threading.Lock()
 app = Flask(__name__)
 
@@ -1845,6 +1847,16 @@ def get_broadcast():
         msgs = db.get("broadcasts", [])
         last = msgs[-1] if msgs else None
     return jsonify(ok=True, broadcast=last)
+
+
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify(ok=True, status="Nexus Server en ligne", version="2.0"), 200
+
+@app.route("/ping", methods=["GET"])
+@app.route("/nxc/ping_ext", methods=["GET"])
+def ping_health():
+    return jsonify(ok=True, ts=int(time.time()*1000)), 200
 
 
 if __name__ == "__main__":
