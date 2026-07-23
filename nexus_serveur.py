@@ -447,8 +447,27 @@ def nxc_price():
     if last_ts <= 0:
         NXC_MARKET["ts"] = now_ms
         last_ts = now_ms
-    # Le thread _nxc_autotick gère le prix — ici on lit seulement
-    pass
+    # Tick de secours si le thread n'a pas tourné depuis 10s
+    with _lock:
+        last_ts = NXC_MARKET.get("ts") or 0
+        if now_ms - last_ts > 10000:
+            import math as _mth
+            volt = NXC_VOLATILITY_MULT.get("value", 1.0)
+            sigma = (0.030 + _rnd.random() * 0.035) * volt
+            tick_idx = NXC_MARKET.get("tick_idx", 0) + 1
+            NXC_MARKET["tick_idx"] = tick_idx
+            cycle = 0.045 * _mth.sin(2 * _mth.pi * tick_idx / 50)
+            noise = (_rnd.random() - 0.50) * sigma
+            target = NXC_MEAN_PRICE.get("target", NXC_MARKET["price"])
+            mr = (target - NXC_MARKET["price"]) / max(1, abs(target - NXC_MARKET["price"]) + 1) * 0.002
+            change = noise + cycle + mr
+            p = max(0.01, NXC_MARKET["price"] * (1 + change))
+            NXC_MARKET["price"] = round(p, 4)
+            NXC_MARKET["ts"] = now_ms
+            hist = NXC_MARKET.setdefault("history", [])
+            hist.append({"t": now_ms, "p": NXC_MARKET["price"]})
+            if len(hist) > 500:
+                del hist[:-500]
     return jsonify({
         "ok": True,
         "price": NXC_MARKET["price"],
