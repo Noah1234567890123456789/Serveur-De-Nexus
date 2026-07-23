@@ -1400,7 +1400,15 @@ def admin_merge():
                 continue
             cur = db["users"].get(name)
             if not cur or u.get("updated", "") > cur.get("updated", ""):
-                db["users"][name] = u
+                if cur:
+                    merged = dict(cur)
+                    merged.update({k: v for k, v in u.items() if k not in ("ok", "username")})
+                    for f in ("password",):
+                        if f in cur and f not in u:
+                            merged[f] = cur[f]
+                    db["users"][name] = merged
+                else:
+                    db["users"][name] = u
         seen = {(m["user"], m["time"], m["text"]) for m in db.get("forum", [])}
         for m in incoming.get("forum", []) or []:
             key = (m.get("user"), m.get("time"), m.get("text"))
