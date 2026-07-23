@@ -235,7 +235,7 @@ def _cors(resp):
     return resp
 
 _hits = defaultdict(list)
-_RATE_MAX = 30
+_RATE_MAX = 200
 _RATE_WINDOW = 60
 
 def client_ip():
