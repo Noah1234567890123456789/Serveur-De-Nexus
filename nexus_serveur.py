@@ -112,12 +112,12 @@ def _nxc_autotick():
             time.sleep(4)
             p = NXC_MARKET["price"]
             volt = NXC_VOLATILITY_MULT.get("value", 1.0)
-            sigma = (0.030 + _rnd.random() * 0.035) * volt
+            sigma = (0.008 + _rnd.random() * 0.012) * volt
             # Bruit symétrique : ni haussier ni baissier
             noise = (_rnd.random() - 0.50) * sigma
-            # Sinus forcé : GARANTIT montée ET descente — amplitude ±4.5%
+            # Sinus léger : amplitude ±0.6%
             tick_idx = len(NXC_MARKET["history"])
-            cycle = 0.045 * _mth.sin(2 * _mth.pi * tick_idx / _cycle_period)
+            cycle = 0.006 * _mth.sin(2 * _mth.pi * tick_idx / _cycle_period)
             # Mean-reversion douce vers la cible (0.15% max)
             if NXC_MEAN_PRICE.get("enabled") and NXC_MEAN_PRICE.get("target", 0) > 0:
                 target = float(NXC_MEAN_PRICE["target"])
@@ -460,10 +460,10 @@ def nxc_price():
         if now_ms - last_ts > 10000:
             import math as _mth
             volt = NXC_VOLATILITY_MULT.get("value", 1.0)
-            sigma = (0.030 + _rnd.random() * 0.035) * volt
+            sigma = (0.008 + _rnd.random() * 0.012) * volt
             tick_idx = NXC_MARKET.get("tick_idx", 0) + 1
             NXC_MARKET["tick_idx"] = tick_idx
-            cycle = 0.045 * _mth.sin(2 * _mth.pi * tick_idx / 50)
+            cycle = 0.006 * _mth.sin(2 * _mth.pi * tick_idx / 50)
             noise = (_rnd.random() - 0.50) * sigma
             target = NXC_MEAN_PRICE.get("target", NXC_MARKET["price"])
             mr = (target - NXC_MARKET["price"]) / max(1, abs(target - NXC_MARKET["price"]) + 1) * 0.002
@@ -2147,9 +2147,9 @@ def nxc_market_simulate():
     p = p0
     trajectory = [round(p, 2)]
     for i in range(n):
-        sigma = 0.030 + _r.random() * 0.035
+        sigma = 0.008 + _r.random() * 0.012
         noise = (_r.random() - 0.50) * sigma
-        cycle = 0.045 * _m.sin(2 * _m.pi * (tick0 + i) / 150)
+        cycle = 0.006 * _m.sin(2 * _m.pi * (tick0 + i) / 150)
         mr = (target - p) / max(p, 1) * 0.002
         adj = noise + cycle + mr + drift * 0.025
         p = max(50.0, min(100000.0, p * (1 + adj)))
