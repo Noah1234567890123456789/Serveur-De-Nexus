@@ -275,8 +275,13 @@ def make_user(pw, role):
             "created": now_iso(), "updated": now_iso()}
 
 def check(db, u, p):
-    x = db["users"].get(u)
-    return bool(x) and secrets.compare_digest(x["pass_hash"], hash_pw(p, x["salt"]))
+    try:
+        x = db["users"].get(u)
+        if not x or not x.get("salt") or not x.get("pass_hash"):
+            return False
+        return secrets.compare_digest(x["pass_hash"], hash_pw(p, x["salt"]))
+    except Exception:
+        return False
 
 def is_admin(db, u, p):
     x = db["users"].get(u)
@@ -984,21 +989,24 @@ def register():
 
 @app.post("/login")
 def login():
-    if rate_limited():
-        return jsonify(ok=False, error="trop de tentatives, réessaie dans 1 min")
-    d = request.get_json(force=True, silent=True) or {}
-    u = (d.get("username") or "").strip()
-    p = d.get("password") or ""
-    with _lock:
-        db = load_db()
-        if not check(db, u, p):
-            return jsonify(ok=False, error="identifiants incorrects")
-        log = db["users"][u].setdefault("logins", [])
-        log.insert(0, {"ip": client_ip(), "time": now_iso()})
-        del log[50:]
-        save_db(db)
-        x = db["users"][u]
-    return jsonify(ok=True, role=x["role"], nickname=x.get("nickname", ""), data=x.get("data", {}))
+    try:
+        if rate_limited():
+            return jsonify(ok=False, error="trop de tentatives, réessaie dans 1 min")
+        d = request.get_json(force=True, silent=True) or {}
+        u = (d.get("username") or "").strip()
+        p = d.get("password") or ""
+        with _lock:
+            db = load_db()
+            if not check(db, u, p):
+                return jsonify(ok=False, error="identifiants incorrects")
+            log = db["users"][u].setdefault("logins", [])
+            log.insert(0, {"ip": client_ip(), "time": now_iso()})
+            del log[50:]
+            save_db(db)
+            x = db["users"][u]
+        return jsonify(ok=True, role=x["role"], nickname=x.get("nickname", ""), data=x.get("data", {}))
+    except Exception as e:
+        return jsonify(ok=False, error="Erreur serveur: " + str(e)), 500
 
 
 @app.post("/sync")
@@ -1801,7 +1809,7 @@ def admin_reset_pw():
             return jsonify(ok=False, error="user et new_password requis (min 4 car)")
         if user not in db["users"]:
             return jsonify(ok=False, error="Utilisateur introuvable")
-        salt = _os.urandom(16).hex()
+        salt = os.urandom(16).hex()
         db["users"][user]["salt"] = salt
         db["users"][user]["pass_hash"] = hash_pw(new_pw, salt)
         db["users"][user]["updated"] = _dt.datetime.utcnow().isoformat()
