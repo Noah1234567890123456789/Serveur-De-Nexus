@@ -1614,7 +1614,9 @@ def nxc_volatility():
 
 @app.route("/nxc/price/set", methods=["POST"])
 def nxc_price_set():
-    """Force le prix NXC a une valeur precise (urgence / correction)."""
+    """Force le prix NXC a une valeur precise — devient le nouveau prix de référence.
+    Le marché fluctuera ensuite autour de ce prix.
+    Le nouveau prix est immédiatement persisté dans la DB pour survivre aux redémarrages."""
     body = request.get_json(force=True, silent=True) or {}
     mk = (body.get("master_key") or "")
     if not mk or not secrets.compare_digest(mk, MASTER_KEY):
@@ -1623,13 +1625,30 @@ def nxc_price_set():
     if price < 50 or price > 999999:
         return jsonify({"ok": False, "error": "Prix hors limites (50–999999)"}), 400
     now_ms = int(time.time() * 1000)
-    NXC_MARKET["price"] = round(price, 2)
+    p = round(price, 2)
+    NXC_MARKET["price"] = p
     NXC_MARKET["ts"]    = now_ms
-    NXC_MARKET["history"].append({"price": round(price, 2), "ts": now_ms,
-                                   "vol": 0, "event": "force"})
+    NXC_MARKET["history"].append({"price": p, "ts": now_ms, "vol": 0, "event": "force_set"})
     if len(NXC_MARKET["history"]) > 576:
         NXC_MARKET["history"] = NXC_MARKET["history"][-576:]
-    return jsonify({"ok": True, "price": NXC_MARKET["price"]})
+    # Persister immédiatement dans la DB (sinon perdu au prochain redémarrage)
+    try:
+        with _lock:
+            db = load_db()
+            noah = db.get("users", {}).get("noah")
+            if noah is not None:
+                noah.setdefault("data", {})["nxcoin_market"] = {
+                    "price": p,
+                    "history": NXC_MARKET["history"][-144:],
+                    "volume24": NXC_MARKET.get("volume24", 0),
+                    "trades24": NXC_MARKET.get("trades24", 0),
+                    "ts": now_ms,
+                    "base_price": p   # prix de référence mémorisé
+                }
+                save_db(db)
+    except Exception as _e:
+        pass  # Ne pas bloquer la réponse si la DB est indisponible
+    return jsonify({"ok": True, "price": p, "message": "Prix défini et sauvegardé"})
 
 
 @app.route("/nxc/dashboard", methods=["GET"])
@@ -1857,6 +1876,85 @@ def index():
 @app.route("/nxc/ping_ext", methods=["GET"])
 def ping_health():
     return jsonify(ok=True, ts=int(time.time()*1000)), 200
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DOCUMENTATION INTERNE — ARCHITECTURE NEXUS SERVER
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# FLUX DE DONNÉES :
+#   Client HTML  ──►  Flask Routes  ──►  DB JSON (nexus_db.json)
+#                          │
+#                     NXC_MARKET (dict en mémoire)
+#                          │
+#                    _nxc_autotick() (thread daemon, toutes les 15s)
+#
+# BASE DE DONNÉES :
+#   Format : JSON sur disque  →  /data/nexus_db.json  (Render disk)
+#   Structure :
+#     {
+#       "users": {
+#         "noah": {
+#           "pass_hash": "...", "salt": "...",
+#           "rewards": 0, "nxc": 0,
+#           "data": { "nxcoin_market": { "price": ..., "history": [...] } }
+#         }
+#       }
+#     }
+#
+# PRIX NXC :
+#   - NXC_MARKET["price"]  →  prix courant en mémoire
+#   - /nxc/price/set       →  force un nouveau prix ET le persiste en DB
+#   - _load_nxc_from_db()  →  restaure le dernier prix au démarrage
+#   - _nxc_autotick()      →  fait fluctuer le prix toutes les 15s
+#                             et persiste en DB toutes les ~2 min (8 ticks)
+#
+# KEEP-ALIVE :
+#   - UptimeRobot ping /ping toutes les 5 min
+#   - Le serveur répond {"ok": true, "ts": <timestamp>}
+#   - Empêche Render free tier de mettre le serveur en veille
+#
+# SÉCURITÉ :
+#   - MASTER_KEY : variable d'env NEXUS_MASTER_KEY sur Render
+#   - Passwords : PBKDF2-HMAC-SHA256 avec salt aléatoire 32 bytes
+#   - Rate limiting : _RATE_MAX = 200 req/min par IP
+#   - CORS : Access-Control-Allow-Origin: * (Cloudflare Pages → Render)
+#
+# ROUTES PRINCIPALES :
+#   POST /login               →  authentification utilisateur
+#   GET  /nxc/price           →  prix actuel + historique
+#   POST /nxc/price/set       →  forcer un nouveau prix (admin)
+#   POST /nxc/bank            →  acheter / vendre du NXC
+#   GET  /ping                →  health check UptimeRobot
+#   GET  /                    →  index / health check
+#   POST /admin/merge         →  modifier un compte utilisateur
+#   GET  /admin/get           →  lire un compte utilisateur
+#
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/nxc/market/status", methods=["GET"])
+def nxc_market_status():
+    """Retourne un résumé complet de l'état du marché NXC.
+    Utile pour déboguer ou afficher un dashboard rapide."""
+    hist = NXC_MARKET.get("history", [])
+    prices = [float(h.get("price", 0)) for h in hist if h.get("price")]
+    p_now = float(NXC_MARKET.get("price", 0))
+    p_open = prices[0] if prices else p_now
+    p_hi = max(prices) if prices else p_now
+    p_lo = min(prices) if prices else p_now
+    chg = round(((p_now - p_open) / max(p_open, 1)) * 100, 2) if p_open else 0
+    return jsonify({
+        "ok": True,
+        "price": p_now,
+        "open": p_open,
+        "high": p_hi,
+        "low": p_lo,
+        "change_pct": chg,
+        "ticks": len(hist),
+        "ts": NXC_MARKET.get("ts", 0),
+        "db_path": DB_FILE
+    })
 
 
 if __name__ == "__main__":
