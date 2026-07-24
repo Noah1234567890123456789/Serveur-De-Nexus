@@ -165,6 +165,49 @@ def _ensure_tick():
 
 _ensure_tick()  # démarrer le thread au lancement du serveur
 
+# ══ AUTO-KEEP-ALIVE : se ping toutes les 4 min pour ne jamais dormir sur Render ══
+_SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:" + str(PORT))
+
+def _self_ping_loop():
+    """Thread : ping /ping toutes les 4 minutes pour garder Render éveillé."""
+    import urllib.request
+    time.sleep(30)  # attendre que le serveur soit prêt
+    while True:
+        try:
+            urllib.request.urlopen(_SELF_URL + "/ping", timeout=10)
+        except Exception:
+            pass
+        time.sleep(240)  # toutes les 4 minutes
+
+threading.Thread(target=_self_ping_loop, daemon=True).start()
+
+# ══ DB BACKUP ROBUSTE : sauvegarde secondaire pour récupération après crash ══
+_BACKUP_FILE = DB_FILE + ".bak"
+
+_orig_save_db = save_db
+def save_db(db):
+    """Sauvegarde principale + copie de secours."""
+    _orig_save_db(db)
+    try:
+        import shutil
+        shutil.copy2(DB_FILE, _BACKUP_FILE)
+    except Exception:
+        pass
+
+def load_db():
+    """Charge DB principale, fallback sur backup si corrompue."""
+    for path in [DB_FILE, _BACKUP_FILE]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if "users" in data:
+                    return data
+        except Exception:
+            pass
+    return {"users": {}}
+
+
+
 
 # Restaurer le prix NXC au démarrage (Gunicorn + local)
 try:
@@ -2462,12 +2505,12 @@ def exchange_join():
     with _EX_LOCK:
         if username not in NXC_EX["portfolios"]:
             NXC_EX["portfolios"][username] = {
-                "nxd": 10000.0, "nxc": 0.0,
+                "nxd": 5000.0, "nxc": 1.0,
                 "open_orders": [], "trades": [], "badges": ["🎉 Bienvenue"],
                 "joined": now_iso(), "is_bot": False
             }
             _ex_save()
-            return jsonify({"ok": True, "new": True, "bonus_nxd": 10000})
+            return jsonify({"ok": True, "new": True, "bonus_nxd": 5000, "bonus_nxc": 1})
         return jsonify({"ok": True, "new": False})
 
 @app.route("/exchange/order", methods=["POST"])
@@ -2609,3 +2652,36 @@ def exchange_deposit():
     return jsonify({"ok": True, "target": target, "nxd_added": nxd, "nxc_added": nxc})
 
 # ── Fin NEXUS EXCHANGE ────────────────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  NEXUS OS  —  Sauvegarde / Chargement de l'état de l'OS en ligne
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.route("/nexusos/load", methods=["POST"])
+def nexusos_load():
+    body = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip()
+    password = (body.get("password") or "").strip()
+    db = load_db()
+    if not check(db, username, password):
+        return jsonify({"ok": False, "error": "Identifiants incorrects"}), 403
+    user_data = db["users"][username].get("data", {})
+    os_state = user_data.get("nexusos", {})
+    return jsonify({"ok": True, "state": os_state, "username": username,
+                    "role": db["users"][username].get("role", "user")})
+
+@app.route("/nexusos/save", methods=["POST"])
+def nexusos_save():
+    body = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip()
+    password = (body.get("password") or "").strip()
+    state    = body.get("state", {})
+    db = load_db()
+    if not check(db, username, password):
+        return jsonify({"ok": False, "error": "Identifiants incorrects"}), 403
+    db["users"][username].setdefault("data", {})["nexusos"] = state
+    db["users"][username]["updated"] = now_iso()
+    save_db(db)
+    return jsonify({"ok": True})
+
+# ── Fin NEXUS OS ──────────────────────────────────────────────────────────────
