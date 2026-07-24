@@ -19,9 +19,26 @@ from flask import Flask, request, jsonify, send_file, Response
 MASTER_KEY = os.environ.get("NEXUS_MASTER_KEY", "change-moi-cle-maitre-nexus-2026")
 PORT = int(os.environ.get("PORT", "8000"))
 
+# ══ UPSTASH REDIS — stockage persistant (survit aux redémarrages Render) ══
+# Créer un DB gratuit sur upstash.com → copier REST URL et token dans les env vars Render
+_UPSTASH_URL   = os.environ.get("UPSTASH_URL", "").rstrip("/")
+_UPSTASH_TOKEN = os.environ.get("UPSTASH_TOKEN", "")
+_UPSTASH_KEY   = "nexus_db_v2"
+
 BASE = os.path.dirname(os.path.abspath(__file__))
-# Utilise /data si disponible (disque persistant Render), sinon dossier local
-_DATA_DIR = "/data" if os.path.isdir("/data") else BASE
+# /data = disque persistant Render (payant), /tmp = toujours accessible en écriture, sinon BASE
+def _pick_data_dir():
+    for d in ("/data", "/tmp", BASE):
+        try:
+            test = os.path.join(d, ".write_test")
+            with open(test, "w") as f:
+                f.write("ok")
+            os.remove(test)
+            return d
+        except Exception:
+            continue
+    return BASE
+_DATA_DIR = _pick_data_dir()
 DB_FILE = os.path.join(_DATA_DIR, "nexus_db.json")
 _lock = threading.Lock()
 app = Flask(__name__)
@@ -165,21 +182,39 @@ def _ensure_tick():
 
 _ensure_tick()  # démarrer le thread au lancement du serveur
 
-# ══ AUTO-KEEP-ALIVE : ping toutes les 4 min pour rester éveillé sur Render ══
+# ══ AUTO-KEEP-ALIVE : ping toutes les 60s pour rester éveillé sur Render ══
+# NOTE : lancé via before_request pour survivre au fork Gunicorn multi-worker
+_ping_started = False
+_ping_lock = threading.Lock()
+
 def _self_ping_loop():
     import urllib.request as _ur
     import time as _t
-    _t.sleep(45)
-    _url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:" + str(PORT)) + "/ping"
+    _t.sleep(20)  # attendre que le serveur soit prêt
+    ext_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    loc_url = "http://127.0.0.1:" + str(PORT)
+    urls = []
+    if ext_url:
+        urls.append(ext_url + "/ping")
+    urls.append(loc_url + "/ping")
     while True:
-        try:
-            _ur.urlopen(_url, timeout=8)
-        except Exception:
-            pass
-        _t.sleep(240)
+        for u in urls:
+            try:
+                _ur.urlopen(u, timeout=10)
+                break  # succès sur l'un → pas besoin d'essayer les autres
+            except Exception:
+                pass
+        _t.sleep(60)  # toutes les 60 secondes
 
-import threading as _th
-_th.Thread(target=_self_ping_loop, daemon=True).start()
+def _ensure_ping():
+    global _ping_started
+    if _ping_started:
+        return
+    with _ping_lock:
+        if not _ping_started:
+            _ping_started = True
+            import threading as _th2
+            _th2.Thread(target=_self_ping_loop, daemon=True).start()
 
 
 # Restaurer le prix NXC au démarrage (Gunicorn + local)
@@ -272,7 +307,60 @@ def now_iso():
 
 _BACKUP_FILE = DB_FILE + ".bak"
 
+# ── Upstash helpers ────────────────────────────────────────────────────────────
+def _upstash_get():
+    """Charge la DB depuis Upstash Redis via REST API (ne lève jamais d'exception)."""
+    if not (_UPSTASH_URL and _UPSTASH_TOKEN):
+        return None
+    import urllib.request as _ur
+    try:
+        cmd = json.dumps(["GET", _UPSTASH_KEY]).encode()
+        req = _ur.Request(
+            _UPSTASH_URL,
+            data=cmd,
+            headers={"Authorization": "Bearer " + _UPSTASH_TOKEN,
+                     "Content-Type": "application/json"}
+        )
+        resp = _ur.urlopen(req, timeout=12)
+        result = json.loads(resp.read()).get("result")
+        if result:
+            data = json.loads(result)
+            if isinstance(data, dict) and "users" in data:
+                return data
+    except Exception:
+        pass
+    return None
+
+def _upstash_set(db):
+    """Sauvegarde la DB dans Upstash Redis (appelé dans un thread, ne bloque pas)."""
+    if not (_UPSTASH_URL and _UPSTASH_TOKEN):
+        return
+    import urllib.request as _ur
+    try:
+        val = json.dumps(db, ensure_ascii=False)
+        cmd = json.dumps(["SET", _UPSTASH_KEY, val]).encode()
+        req = _ur.Request(
+            _UPSTASH_URL,
+            data=cmd,
+            headers={"Authorization": "Bearer " + _UPSTASH_TOKEN,
+                     "Content-Type": "application/json"}
+        )
+        _ur.urlopen(req, timeout=15)
+    except Exception:
+        pass
+
 def load_db():
+    # 1. Upstash en priorité — survit aux redémarrages Render
+    data = _upstash_get()
+    if data:
+        # Re-synchronise aussi le fichier local comme cache
+        try:
+            with open(DB_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        return data
+    # 2. Fichier local (et son backup)
     for path in (DB_FILE, _BACKUP_FILE):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -284,16 +372,21 @@ def load_db():
     return {"users": {}}
 
 def save_db(db):
-    tmp = DB_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, DB_FILE)
-    # Backup copy for crash recovery
+    # 1. Fichier local (avec backup atomique)
     try:
-        import shutil
-        shutil.copy2(DB_FILE, _BACKUP_FILE)
+        tmp = DB_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, DB_FILE)
+        try:
+            import shutil
+            shutil.copy2(DB_FILE, _BACKUP_FILE)
+        except Exception:
+            pass
     except Exception:
         pass
+    # 2. Upstash (async — ne bloque pas la réponse HTTP)
+    threading.Thread(target=_upstash_set, args=(db,), daemon=True).start()
 
 def hash_pw(pw, salt):
     return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), bytes.fromhex(salt), 200_000).hex()
@@ -1899,6 +1992,10 @@ def get_broadcast():
 @app.route("/", methods=["GET"])
 def index():
     return jsonify(ok=True, status="Nexus Server en ligne", version="2.0"), 200
+
+@app.before_request
+def _start_ping_on_first_request():
+    _ensure_ping()
 
 @app.route("/ping", methods=["GET"])
 @app.route("/nxc/ping_ext", methods=["GET"])
