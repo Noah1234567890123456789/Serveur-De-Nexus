@@ -130,22 +130,22 @@ def _nxc_autotick():
             p = NXC_MARKET["price"]
             volt = NXC_VOLATILITY_MULT.get("value", 1.0)
             sigma = (0.008 + _rnd.random() * 0.012) * volt
-            # Bruit symétrique : ni haussier ni baissier
-            noise = (_rnd.random() - 0.50) * sigma
+            # Bruit légèrement haussier : +0.0002 de biais positif par tick
+            noise = (_rnd.random() - 0.4997) * sigma
             # Sinus léger : amplitude ±0.6%
             tick_idx = len(NXC_MARKET["history"])
             cycle = 0.006 * _mth.sin(2 * _mth.pi * tick_idx / _cycle_period)
-            # Mean-reversion douce vers la cible (0.15% max)
+            # Mean-reversion douce vers la cible courante (suit le prix si admin change)
             if NXC_MEAN_PRICE.get("enabled") and NXC_MEAN_PRICE.get("target", 0) > 0:
                 target = float(NXC_MEAN_PRICE["target"])
-                mr = (target - p) / max(p, 1) * 0.0015
+                mr = (target - p) / max(p, 1) * 0.0005  # force réduite : 0.05% max
             else:
                 mr = 0.0
             drift_adj = NXC_BIAS.get("drift", 0) * 0.025
             adj = noise + cycle + mr + drift_adj
-            if p > 80000: adj -= 0.02
-            if p < 200:   adj += 0.02
-            p = max(50.0, min(100000.0, p * (1 + adj)))
+            # Suppression du cap forcé à 80k — le prix peut aller jusqu'à 999 999
+            if p < 200: adj += 0.02
+            p = max(50.0, min(999999.0, p * (1 + adj)))
             p = round(p * 100) / 100
             NXC_MARKET["price"] = p
             NXC_MARKET["ts"] = int(time.time() * 1000)
@@ -585,11 +585,11 @@ def nxc_price():
             tick_idx = NXC_MARKET.get("tick_idx", 0) + 1
             NXC_MARKET["tick_idx"] = tick_idx
             cycle = 0.006 * _mth.sin(2 * _mth.pi * tick_idx / 50)
-            noise = (_rnd.random() - 0.50) * sigma
+            noise = (_rnd.random() - 0.4997) * sigma  # léger biais haussier
             target = NXC_MEAN_PRICE.get("target", NXC_MARKET["price"])
-            mr = (target - NXC_MARKET["price"]) / max(1, abs(target - NXC_MARKET["price"]) + 1) * 0.002
+            mr = (target - NXC_MARKET["price"]) / max(NXC_MARKET["price"], 1) * 0.0005  # force réduite
             change = noise + cycle + mr
-            p = max(0.01, NXC_MARKET["price"] * (1 + change))
+            p = max(0.01, min(999999.0, NXC_MARKET["price"] * (1 + change)))
             NXC_MARKET["price"] = round(p, 4)
             NXC_MARKET["ts"] = now_ms
             hist = NXC_MARKET.setdefault("history", [])
@@ -618,6 +618,8 @@ def nxc_tick():
     if price < 50 or price > 100000:
         return jsonify(ok=False, error="Prix invalide"), 400
     NXC_MARKET["price"] = price
+    # Mettre à jour la cible de mean-reversion pour que le prix reste autour du nouveau prix
+    NXC_MEAN_PRICE["target"] = price
     NXC_MARKET["ts"] = body.get("ts", int(time.time() * 1000))
     NXC_MARKET["volume24"] = body.get("volume24", NXC_MARKET["volume24"])
     NXC_MARKET["trades24"] = body.get("trades24", NXC_MARKET["trades24"])
