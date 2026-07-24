@@ -165,48 +165,21 @@ def _ensure_tick():
 
 _ensure_tick()  # démarrer le thread au lancement du serveur
 
-# ══ AUTO-KEEP-ALIVE : se ping toutes les 4 min pour ne jamais dormir sur Render ══
-_SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:" + str(PORT))
-
+# ══ AUTO-KEEP-ALIVE : ping toutes les 4 min pour rester éveillé sur Render ══
 def _self_ping_loop():
-    """Thread : ping /ping toutes les 4 minutes pour garder Render éveillé."""
-    import urllib.request
-    time.sleep(30)  # attendre que le serveur soit prêt
+    import urllib.request as _ur
+    import time as _t
+    _t.sleep(45)
+    _url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:" + str(PORT)) + "/ping"
     while True:
         try:
-            urllib.request.urlopen(_SELF_URL + "/ping", timeout=10)
+            _ur.urlopen(_url, timeout=8)
         except Exception:
             pass
-        time.sleep(240)  # toutes les 4 minutes
+        _t.sleep(240)
 
-threading.Thread(target=_self_ping_loop, daemon=True).start()
-
-# ══ DB BACKUP ROBUSTE : sauvegarde secondaire pour récupération après crash ══
-_BACKUP_FILE = DB_FILE + ".bak"
-
-_orig_save_db = save_db
-def save_db(db):
-    """Sauvegarde principale + copie de secours."""
-    _orig_save_db(db)
-    try:
-        import shutil
-        shutil.copy2(DB_FILE, _BACKUP_FILE)
-    except Exception:
-        pass
-
-def load_db():
-    """Charge DB principale, fallback sur backup si corrompue."""
-    for path in [DB_FILE, _BACKUP_FILE]:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if "users" in data:
-                    return data
-        except Exception:
-            pass
-    return {"users": {}}
-
-
+import threading as _th
+_th.Thread(target=_self_ping_loop, daemon=True).start()
 
 
 # Restaurer le prix NXC au démarrage (Gunicorn + local)
@@ -297,18 +270,30 @@ def rate_limited():
 def now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
 
+_BACKUP_FILE = DB_FILE + ".bak"
+
 def load_db():
-    try:
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"users": {}}
+    for path in (DB_FILE, _BACKUP_FILE):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and "users" in data:
+                return data
+        except Exception:
+            pass
+    return {"users": {}}
 
 def save_db(db):
     tmp = DB_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
     os.replace(tmp, DB_FILE)
+    # Backup copy for crash recovery
+    try:
+        import shutil
+        shutil.copy2(DB_FILE, _BACKUP_FILE)
+    except Exception:
+        pass
 
 def hash_pw(pw, salt):
     return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), bytes.fromhex(salt), 200_000).hex()
