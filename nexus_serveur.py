@@ -627,6 +627,23 @@ def nxc_tick():
     NXC_MARKET["history"].append(entry)
     if len(NXC_MARKET["history"]) > 576:
         NXC_MARKET["history"] = NXC_MARKET["history"][-576:]
+    # Persister dans Redis pour survivre aux redémarrages Render
+    try:
+        with _lock:
+            db = load_db()
+            noah = db.get("users", {}).get("noah")
+            if noah is not None:
+                noah.setdefault("data", {})["nxcoin_market"] = {
+                    "price": price,
+                    "history": NXC_MARKET["history"][-144:],
+                    "volume24": NXC_MARKET.get("volume24", 0),
+                    "trades24": NXC_MARKET.get("trades24", 0),
+                    "ts": NXC_MARKET["ts"],
+                    "base_price": price
+                }
+                save_db(db)
+    except Exception:
+        pass
     return jsonify(ok=True)
 
 
