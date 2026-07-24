@@ -226,7 +226,7 @@ except Exception:
 # Anti-dérive automatique : la mean reversion est activée dès le démarrage
 # pour neutraliser le biais haussier naturel de l'autotick (+0.02*sigma par tick).
 # L'admin peut toujours la désactiver / changer la cible depuis le panel Contrôle.
-NXC_MEAN_PRICE["enabled"] = True   # mean-reversion douce (0.3%) vers la cible
+NXC_MEAN_PRICE["enabled"] = False  # désactivée — la cible suit le prix admin
 
 # ==============================================================================
 # BLOC DE CONFIGURATION AVANCÉE — options étendues du serveur NXC
@@ -586,8 +586,7 @@ def nxc_price():
             NXC_MARKET["tick_idx"] = tick_idx
             cycle = 0.006 * _mth.sin(2 * _mth.pi * tick_idx / 50)
             noise = (_rnd.random() - 0.4997) * sigma  # léger biais haussier
-            target = NXC_MEAN_PRICE.get("target", NXC_MARKET["price"])
-            mr = (target - NXC_MARKET["price"]) / max(NXC_MARKET["price"], 1) * 0.0005  # force réduite
+            mr = 0.0  # mean-reversion désactivée dans le tick per-request
             change = noise + cycle + mr
             p = max(0.01, min(999999.0, NXC_MARKET["price"] * (1 + change)))
             NXC_MARKET["price"] = round(p, 4)
