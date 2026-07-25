@@ -1256,19 +1256,20 @@ def sync():
             return jsonify(ok=False, error="identifiants invalides")
         new_data = d.get("data", {})
         old_data = db["users"][u].get("data", {})
-        # Fusionner en gardant le MAX des rewards pour eviter ecrasement
-        new_rew = float((new_data.get("nx2098") or {}).get("rewards") or 0)
-        new_pts = float((new_data.get("rewards") or {}).get("points") or 0)
-        max_rew = max(new_rew, new_pts)  # admin/merge a l'autorité finale
-        # Appliquer les nouvelles donnees
+        # ⚠️ CORRECTIF ACHAT : avant, /sync forçait rewards = MAX(ancien, nouveau).
+        # Comme un ACHAT DIMINUE les rewards, le MAX restaurait l'ancienne valeur
+        # → l'argent dépensé "revenait" et le NXC acheté disparaissait.
+        # Désormais /sync NE TOUCHE PLUS aux rewards : la valeur actuelle du serveur
+        # fait autorité (elle est mise à jour par les achats via /admin/merge et par
+        # /admin/give-rewards). /sync ne gère que nxc, forum, bank, etc.
+        cur_rew = float((old_data.get("nx2098") or {}).get("rewards") or 0)
+        cur_pts = float((old_data.get("rewards") or {}).get("points") or 0)
+        keep_rew = cur_rew if cur_rew else cur_pts   # valeur serveur = vérité
+        # Appliquer les nouvelles donnees (nxc, historique, forum, bank...)
         db["users"][u]["data"] = new_data
-        # Mais forcer le MAX des rewards
-        if "nx2098" not in db["users"][u]["data"]:
-            db["users"][u]["data"]["nx2098"] = {}
-        db["users"][u]["data"]["nx2098"]["rewards"] = max_rew
-        if "rewards" not in db["users"][u]["data"]:
-            db["users"][u]["data"]["rewards"] = {}
-        db["users"][u]["data"]["rewards"]["points"] = max_rew
+        # Restaurer les rewards du serveur (jamais écrasés par une valeur périmée)
+        db["users"][u]["data"].setdefault("nx2098", {})["rewards"] = keep_rew
+        db["users"][u]["data"].setdefault("rewards", {})["points"] = keep_rew
         db["users"][u]["updated"] = now_iso()
         save_db(db)
     return jsonify(ok=True)
