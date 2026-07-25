@@ -583,21 +583,51 @@ def _db_load_source():
             pass
     return {"users": {}}
 
+_DB_CACHE_MTIME = 0.0
+
 def load_db():
-    global _DB_CACHE
+    """Cache mémoire, mais relit le fichier partagé s'il a changé (multi-worker safe).
+
+    Le fichier local nexus_db.json est partagé par tous les workers gunicorn du
+    même conteneur. En surveillant sa date de modification, chaque worker voit
+    immédiatement les écritures des autres — tout en évitant de relire Upstash
+    (asynchrone, source de la course qui effaçait points/comptes)."""
+    global _DB_CACHE, _DB_CACHE_MTIME
+    try:
+        mt = os.path.getmtime(DB_FILE)
+    except Exception:
+        mt = 0.0
     if _DB_CACHE is None:
         _DB_CACHE = _db_load_source()
+        try:
+            _DB_CACHE_MTIME = os.path.getmtime(DB_FILE)
+        except Exception:
+            _DB_CACHE_MTIME = mt
+    elif mt > _DB_CACHE_MTIME:
+        # Un autre worker a écrit → recharger depuis le fichier partagé
+        try:
+            with open(DB_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict) and "users" in d:
+                _DB_CACHE = d
+                _DB_CACHE_MTIME = mt
+        except Exception:
+            pass
     return _DB_CACHE
 
 def save_db(db):
-    global _DB_CACHE
-    _DB_CACHE = db  # la mémoire est la vérité — jamais écrasée par une lecture périmée
+    global _DB_CACHE, _DB_CACHE_MTIME
+    _DB_CACHE = db
     # 1. Fichier local (avec backup atomique)
     try:
         tmp = DB_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(db, f, ensure_ascii=False, indent=2)
         os.replace(tmp, DB_FILE)
+        try:
+            _DB_CACHE_MTIME = os.path.getmtime(DB_FILE)
+        except Exception:
+            pass
         try:
             import shutil
             shutil.copy2(DB_FILE, _BACKUP_FILE)
@@ -1434,6 +1464,39 @@ def sync():
     return jsonify(ok=True)
 
 
+@app.post("/rewards/add")
+def rewards_add():
+    """Ajoute/retire des points de récompense de façon ATOMIQUE (serveur = vérité).
+
+    Utilisé par TOUTES les apps (navigateur Nexus, coin...) pour gagner/dépenser
+    des points sans s'écraser mutuellement. On envoie un delta (+5 pour une
+    recherche, -prix pour une récompense), le serveur calcule le nouveau total.
+    Les points sont ainsi stockés au même endroit que le reste (compte serveur)
+    et survivent au rafraîchissement.
+    """
+    d = request.get_json(force=True, silent=True) or {}
+    u = (d.get("username") or "").strip()
+    p = d.get("password") or ""
+    try:
+        delta = float(d.get("delta", 0))
+    except (TypeError, ValueError):
+        delta = 0.0
+    with _lock:
+        db = load_db()
+        if not check(db, u, p):
+            return jsonify(ok=False, error="identifiants invalides")
+        data = db["users"][u].setdefault("data", {})
+        cur = (data.get("rewards") or {}).get("points")
+        if cur is None:
+            cur = (data.get("nx2098") or {}).get("rewards") or 0
+        new = max(0.0, round(float(cur) + delta, 2))
+        data.setdefault("rewards", {})["points"] = new
+        data.setdefault("nx2098", {})["rewards"] = new
+        db["users"][u]["updated"] = now_iso()
+        save_db(db)
+    return jsonify(ok=True, points=new)
+
+
 @app.post("/change_password")
 def change_password():
     d = request.get_json(force=True, silent=True) or {}
@@ -1953,6 +2016,86 @@ def nxc_growth():
 
 # Config des onglets (favoris + masqués) — synchronisée sur tous les appareils
 _TABCFG_DEFAULT = {"favorites": [], "hidden": ["historique", "convertisseur", "evenements"]}
+
+@app.route("/nexus/config", methods=["GET", "POST"])
+def nexus_config():
+    """Config du navigateur Nexus (points recherche, boutique de récompenses,
+    demandes en cours). GET public (tous les utilisateurs la lisent),
+    POST réservé à l'admin (clé maître)."""
+    default = {
+        "searchPoints": 3, "appOpenBase": 1, "newAccountBonus": 100,
+        "rewards": [], "requests": []
+    }
+    if request.method == "GET":
+        with _lock:
+            db = load_db()
+            cfg = db.get("nexus_config") or dict(default)
+        for k, v in default.items():
+            cfg.setdefault(k, v)
+        return jsonify({"ok": True, "config": cfg})
+    body = request.get_json(force=True, silent=True) or {}
+    mk = (body.get("master_key") or "")
+    if not mk or not secrets.compare_digest(mk, MASTER_KEY):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 403
+    incoming = body.get("config") or {}
+    with _lock:
+        db = load_db()
+        cur = db.get("nexus_config") or dict(default)
+        for k in ("searchPoints", "appOpenBase", "newAccountBonus"):
+            if k in incoming:
+                try:
+                    cur[k] = float(incoming[k])
+                except (TypeError, ValueError):
+                    pass
+        if "rewards" in incoming:
+            cur["rewards"] = incoming["rewards"][:100]
+        if "requests" in incoming:
+            cur["requests"] = incoming["requests"][:300]
+        db["nexus_config"] = cur
+        save_db(db)
+    return jsonify({"ok": True, "config": cur})
+
+
+@app.post("/nexus/request")
+def nexus_request():
+    """Un utilisateur demande une récompense À VALIDER : on débite ses points
+    (atomique) et on ajoute une demande en attente que l'admin traitera."""
+    d = request.get_json(force=True, silent=True) or {}
+    u = (d.get("username") or "").strip()
+    p = d.get("password") or ""
+    try:
+        price = float(d.get("price", 0))
+    except (TypeError, ValueError):
+        price = 0.0
+    name = (d.get("rewardName") or "")[:80]
+    rid = (d.get("rewardId") or "")[:80]
+    with _lock:
+        db = load_db()
+        if not check(db, u, p):
+            return jsonify(ok=False, error="identifiants invalides")
+        data = db["users"][u].setdefault("data", {})
+        cur = (data.get("rewards") or {}).get("points")
+        if cur is None:
+            cur = (data.get("nx2098") or {}).get("rewards") or 0
+        cur = float(cur)
+        if cur < price:
+            return jsonify(ok=False, error="Points insuffisants")
+        new = round(cur - price, 2)
+        data.setdefault("rewards", {})["points"] = new
+        data.setdefault("nx2098", {})["rewards"] = new
+        cfg = db.get("nexus_config") or {}
+        reqs = cfg.get("requests") or []
+        reqs.append({
+            "id": secrets.token_hex(6), "user": u, "rewardId": rid,
+            "rewardName": name, "price": price, "ts": int(time.time() * 1000),
+            "status": "pending", "code": ""
+        })
+        cfg["requests"] = reqs[-300:]
+        db["nexus_config"] = cfg
+        db["users"][u]["updated"] = now_iso()
+        save_db(db)
+    return jsonify(ok=True, points=new)
+
 
 @app.route("/nxc/bounds", methods=["GET", "POST"])
 def nxc_bounds():
