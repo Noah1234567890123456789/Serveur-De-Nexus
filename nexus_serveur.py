@@ -3044,7 +3044,7 @@ def get_broadcast():
 
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify(ok=True, status="Nexus Server en ligne", version="2.0"), 200
+    return Response(STORE_HTML, mimetype="text/html")
 
 @app.before_request
 def _start_ping_on_first_request():
@@ -3821,40 +3821,36 @@ def nexusos_save():
 
 # ── Fin NEXUS OS ──────────────────────────────────────────────────────────────
 
+
 # ════════════════════════════════════════════════════════════════════════════════
 #  NEXUS STORE  —  Boutique avec codes de déblocage
-#  Stockage : Upstash Redis (clés séparées, 0 stockage Render)
-#  Fichiers  : Cloudflare R2 (presigned URLs, rien téléchargé côté serveur)
-#  Vidéos    : Cloudflare Stream (signed URL 48h)
+#  Stockage : Upstash Redis (0 stockage Render)
+#  Fichiers  : Cloudflare R2 (presigned URLs)
+#  Vidéos    : Cloudflare Stream (48h)
 # ════════════════════════════════════════════════════════════════════════════════
 
 import hashlib as _hashlib
-import urllib.request as _store_ur
 
 _R2_ACCOUNT_ID  = os.environ.get("R2_ACCOUNT_ID", "")
 _R2_ACCESS_KEY  = os.environ.get("R2_ACCESS_KEY_ID", "")
 _R2_SECRET_KEY  = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 _R2_BUCKET      = os.environ.get("R2_BUCKET_NAME", "")
-_CF_STREAM_CUST = os.environ.get("CF_STREAM_CUSTOMER", "")   # ex: customer-abc.cloudflarestream.com
+_CF_STREAM_CUST = os.environ.get("CF_STREAM_CUSTOMER", "")
 _CF_API_TOKEN   = os.environ.get("CF_API_TOKEN", "")
 
-_STORE_ITEMS_KEY   = "nexus_store_items"    # dict {item_id: item_obj}
-_STORE_UNLOCKS_KEY = "nexus_store_unlocks"  # dict {username: [item_id, ...]}
+_STORE_ITEMS_KEY   = "nexus_store_items"
+_STORE_UNLOCKS_KEY = "nexus_store_unlocks"
 
 def _store_redis_get(key):
-    """Lit une clé Upstash Redis (retourne None si absent ou erreur)."""
     if not (_UPSTASH_URL and _UPSTASH_TOKEN):
         return None
+    import urllib.request as _ur
     try:
         cmd = json.dumps(["GET", key]).encode()
-        req = _store_ur.Request(
-            _UPSTASH_URL,
-            data=cmd,
-            headers={"Authorization": "Bearer " + _UPSTASH_TOKEN,
-                     "Content-Type": "application/json"}
-        )
-        resp = _store_ur.urlopen(req, timeout=12)
-        result = json.loads(resp.read()).get("result")
+        req = _ur.Request(_UPSTASH_URL, data=cmd,
+                          headers={"Authorization": "Bearer " + _UPSTASH_TOKEN,
+                                   "Content-Type": "application/json"})
+        result = json.loads(_ur.urlopen(req, timeout=12).read()).get("result")
         if result:
             return json.loads(result)
     except Exception:
@@ -3862,28 +3858,22 @@ def _store_redis_get(key):
     return None
 
 def _store_redis_set(key, value):
-    """Écrit une clé Upstash Redis (synchrone, petites données)."""
     if not (_UPSTASH_URL and _UPSTASH_TOKEN):
         return
+    import urllib.request as _ur
     try:
-        val = json.dumps(value, ensure_ascii=False)
-        cmd = json.dumps(["SET", key, val]).encode()
-        req = _store_ur.Request(
-            _UPSTASH_URL,
-            data=cmd,
-            headers={"Authorization": "Bearer " + _UPSTASH_TOKEN,
-                     "Content-Type": "application/json"}
-        )
-        _store_ur.urlopen(req, timeout=15)
+        cmd = json.dumps(["SET", key, json.dumps(value, ensure_ascii=False)]).encode()
+        req = _ur.Request(_UPSTASH_URL, data=cmd,
+                          headers={"Authorization": "Bearer " + _UPSTASH_TOKEN,
+                                   "Content-Type": "application/json"})
+        _ur.urlopen(req, timeout=15)
     except Exception:
         pass
 
 def _store_hash_code(code):
-    """SHA256 du code (minuscule, sans espaces)."""
     return _hashlib.sha256(code.strip().lower().encode()).hexdigest()
 
-def _store_r2_presigned(r2_key, expires=3600):
-    """Génère une presigned URL GET pour un fichier R2. Retourne None si R2 non configuré."""
+def _store_r2_presigned(r2_key, filename="fichier", expires=3600):
     if not (_R2_ACCOUNT_ID and _R2_ACCESS_KEY and _R2_SECRET_KEY and _R2_BUCKET):
         return None
     try:
@@ -3897,166 +3887,202 @@ def _store_r2_presigned(r2_key, expires=3600):
             config=_BotoConfig(signature_version="s3v4"),
             region_name="auto"
         )
-        url = s3.generate_presigned_url(
+        return s3.generate_presigned_url(
             "get_object",
-            Params={"Bucket": _R2_BUCKET, "Key": r2_key},
+            Params={"Bucket": _R2_BUCKET, "Key": r2_key,
+                    "ResponseContentDisposition": f'attachment; filename="{filename}"'},
             ExpiresIn=expires
         )
-        return url
     except Exception:
         return None
 
 def _store_stream_url(video_id):
-    """Retourne l'URL de lecture HLS Cloudflare Stream (public signed si token dispo, sinon embed)."""
     if not _CF_STREAM_CUST:
         return None
-    # URL d'embed standard (48h gérée côté item expires_at)
     return f"https://{_CF_STREAM_CUST}/{video_id}/iframe"
 
-# ── Routes utilisateur ────────────────────────────────────────────────────────
+# ── Route principale ──────────────────────────────────────────────────────────
 
-@app.route("/store/items", methods=["POST"])
-def store_items():
-    """Liste tous les items du store (avec indication si débloqués par l'user)."""
-    body = request.get_json(silent=True) or {}
-    username = (body.get("username") or "").strip()
-    password = (body.get("password") or "").strip()
-    db = load_db()
-    if not check(db, username, password):
-        return jsonify({"ok": False, "error": "Identifiants incorrects"}), 403
-    items   = _store_redis_get(_STORE_ITEMS_KEY) or {}
-    unlocks = _store_redis_get(_STORE_UNLOCKS_KEY) or {}
-    user_unlocked = set(unlocks.get(username, []))
+@app.route("/store", methods=["GET"])
+def store_page():
+    return Response(STORE_HTML, mimetype="text/html")
+
+# ── Routes API utilisateur ────────────────────────────────────────────────────
+
+@app.route("/store/api/items", methods=["POST"])
+def store_api_items():
+    """Liste les items publics du store."""
+    items = _store_redis_get(_STORE_ITEMS_KEY) or {}
     result = []
     for iid, item in items.items():
-        entry = {
+        result.append({
             "id":          iid,
             "name":        item.get("name", ""),
             "description": item.get("description", ""),
-            "type":        item.get("type", "file"),   # file | note | video_rental
-            "unlocked":    iid in user_unlocked,
-        }
-        # Si débloqué et video_rental → vérifier expiry
-        if iid in user_unlocked and item.get("type") == "video_rental":
-            exp = (unlocks.get(f"{username}_{iid}_exp") or 0)
-            entry["expires_at"] = exp
-            entry["expired"]    = (exp > 0 and time.time() > exp)
-        result.append(entry)
+            "type":        item.get("type", "file"),
+        })
     return jsonify({"ok": True, "items": result})
 
-@app.route("/store/unlock", methods=["POST"])
-def store_unlock():
-    """Débloque un item en fournissant son code secret."""
-    body = request.get_json(silent=True) or {}
-    username = (body.get("username") or "").strip()
-    password = (body.get("password") or "").strip()
-    code     = (body.get("code") or "").strip()
-    db = load_db()
-    if not check(db, username, password):
-        return jsonify({"ok": False, "error": "Identifiants incorrects"}), 403
-    if not code:
-        return jsonify({"ok": False, "error": "Code manquant"}), 400
-    hashed  = _store_hash_code(code)
-    items   = _store_redis_get(_STORE_ITEMS_KEY) or {}
-    # Trouver l'item correspondant au code
-    matched = None
-    for iid, item in items.items():
-        if item.get("code_hash") == hashed:
-            matched = (iid, item)
-            break
-    if not matched:
-        return jsonify({"ok": False, "error": "Code invalide"}), 400
-    iid, item = matched
-    unlocks = _store_redis_get(_STORE_UNLOCKS_KEY) or {}
-    user_list = unlocks.get(username, [])
-    if iid in user_list:
-        return jsonify({"ok": False, "error": "Déjà débloqué"}), 400
-    user_list.append(iid)
-    unlocks[username] = user_list
-    # Pour video_rental : stocker expiry séparé
-    if item.get("type") == "video_rental":
-        unlocks[f"{username}_{iid}_exp"] = int(time.time()) + 48 * 3600
-    _store_redis_set(_STORE_UNLOCKS_KEY, unlocks)
-    return jsonify({"ok": True, "item_id": iid, "item_name": item.get("name", "")})
-
-@app.route("/store/my_items", methods=["POST"])
-def store_my_items():
-    """Retourne les items débloqués de l'utilisateur avec leur contenu."""
+@app.route("/store/api/my_items", methods=["POST"])
+def store_api_my_items():
+    """Items débloqués de l'utilisateur connecté."""
     body = request.get_json(silent=True) or {}
     username = (body.get("username") or "").strip()
     password = (body.get("password") or "").strip()
     db = load_db()
     if not check(db, username, password):
         return jsonify({"ok": False, "error": "Identifiants incorrects"}), 403
+    role    = db["users"][username].get("role", "user")
     items   = _store_redis_get(_STORE_ITEMS_KEY) or {}
     unlocks = _store_redis_get(_STORE_UNLOCKS_KEY) or {}
-    user_unlocked = unlocks.get(username, [])
+    user_ids = unlocks.get(username, [])
     result = []
-    for iid in user_unlocked:
+    for iid in user_ids:
         item = items.get(iid)
         if not item:
             continue
         itype = item.get("type", "file")
-        entry = {
-            "id":          iid,
-            "name":        item.get("name", ""),
-            "description": item.get("description", ""),
-            "type":        itype,
-        }
-        if itype == "note":
-            entry["content"] = item.get("content", "")
-        elif itype == "file":
-            r2_key = item.get("r2_key", "")
-            entry["download_url"] = _store_r2_presigned(r2_key) if r2_key else None
-        elif itype == "video_rental":
-            exp = (unlocks.get(f"{username}_{iid}_exp") or 0)
+        entry = {"id": iid, "name": item.get("name", ""),
+                 "description": item.get("description", ""), "type": itype}
+        if itype == "video_rental":
+            exp = unlocks.get(f"{username}_{iid}_exp") or 0
             entry["expires_at"] = exp
-            entry["expired"]    = (exp > 0 and time.time() > exp)
-            if not entry["expired"]:
-                vid = item.get("stream_video_id", "")
-                entry["stream_url"] = _store_stream_url(vid) if vid else None
+            entry["expired"]    = bool(exp and time.time() > exp)
         result.append(entry)
-    return jsonify({"ok": True, "items": result})
+    return jsonify({"ok": True, "items": result, "role": role})
+
+@app.route("/store/api/unlock", methods=["POST"])
+def store_api_unlock():
+    """Débloque un item avec son code."""
+    body     = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip()
+    password = (body.get("password") or "").strip()
+    item_id  = (body.get("item_id") or "").strip()
+    code     = (body.get("code") or "").strip()
+    db = load_db()
+    if not check(db, username, password):
+        return jsonify({"ok": False, "error": "Identifiants incorrects"}), 403
+    if not code or not item_id:
+        return jsonify({"ok": False, "error": "Données manquantes"}), 400
+    items = _store_redis_get(_STORE_ITEMS_KEY) or {}
+    item  = items.get(item_id)
+    if not item:
+        return jsonify({"ok": False, "error": "Item introuvable"}), 404
+    hashed = _store_hash_code(code)
+    if item.get("code_hash") != hashed:
+        return jsonify({"ok": False, "error": "Code incorrect"}), 400
+    unlocks  = _store_redis_get(_STORE_UNLOCKS_KEY) or {}
+    user_ids = unlocks.get(username, [])
+    if item_id in user_ids:
+        return jsonify({"ok": False, "error": "Déjà débloqué"}), 400
+    user_ids.append(item_id)
+    unlocks[username] = user_ids
+    if item.get("type") == "video_rental":
+        unlocks[f"{username}_{item_id}_exp"] = int(time.time()) + 48 * 3600
+    _store_redis_set(_STORE_UNLOCKS_KEY, unlocks)
+    return jsonify({"ok": True, "item_id": item_id, "item_name": item.get("name", "")})
+
+@app.route("/store/api/download", methods=["POST"])
+def store_api_download():
+    """Retourne une presigned URL R2 pour télécharger le fichier."""
+    body     = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip()
+    password = (body.get("password") or "").strip()
+    item_id  = (body.get("item_id") or "").strip()
+    db = load_db()
+    if not check(db, username, password):
+        return jsonify({"ok": False, "error": "Identifiants incorrects"}), 403
+    unlocks = _store_redis_get(_STORE_UNLOCKS_KEY) or {}
+    if item_id not in unlocks.get(username, []):
+        return jsonify({"ok": False, "error": "Non débloqué"}), 403
+    items = _store_redis_get(_STORE_ITEMS_KEY) or {}
+    item  = items.get(item_id)
+    if not item:
+        return jsonify({"ok": False, "error": "Item introuvable"}), 404
+    r2_key = item.get("r2_key", "")
+    url    = _store_r2_presigned(r2_key, filename=item.get("name", "fichier")) if r2_key else None
+    return jsonify({"ok": True, "url": url})
+
+@app.route("/store/api/stream", methods=["POST"])
+def store_api_stream():
+    """Retourne l'URL de la vidéo Stream si pas expirée."""
+    body     = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip()
+    password = (body.get("password") or "").strip()
+    item_id  = (body.get("item_id") or "").strip()
+    db = load_db()
+    if not check(db, username, password):
+        return jsonify({"ok": False, "error": "Identifiants incorrects"}), 403
+    unlocks = _store_redis_get(_STORE_UNLOCKS_KEY) or {}
+    if item_id not in unlocks.get(username, []):
+        return jsonify({"ok": False, "error": "Non débloqué"}), 403
+    exp = unlocks.get(f"{username}_{item_id}_exp") or 0
+    if exp and time.time() > exp:
+        return jsonify({"ok": False, "error": "Location expirée"}), 403
+    items = _store_redis_get(_STORE_ITEMS_KEY) or {}
+    item  = items.get(item_id)
+    if not item:
+        return jsonify({"ok": False, "error": "Item introuvable"}), 404
+    vid = item.get("stream_video_id", "")
+    url = _store_stream_url(vid) if vid else None
+    return jsonify({"ok": True, "url": url, "expires_at": exp})
+
+@app.route("/store/api/note", methods=["POST"])
+def store_api_note():
+    """Retourne le contenu texte d'une note débloquée."""
+    body     = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip()
+    password = (body.get("password") or "").strip()
+    item_id  = (body.get("item_id") or "").strip()
+    db = load_db()
+    if not check(db, username, password):
+        return jsonify({"ok": False, "error": "Identifiants incorrects"}), 403
+    unlocks = _store_redis_get(_STORE_UNLOCKS_KEY) or {}
+    if item_id not in unlocks.get(username, []):
+        return jsonify({"ok": False, "error": "Non débloqué"}), 403
+    items = _store_redis_get(_STORE_ITEMS_KEY) or {}
+    item  = items.get(item_id)
+    if not item:
+        return jsonify({"ok": False, "error": "Item introuvable"}), 404
+    return jsonify({"ok": True, "content": item.get("content", ""), "name": item.get("name", "")})
 
 # ── Routes admin ──────────────────────────────────────────────────────────────
 
 @app.route("/store/admin/item", methods=["POST"])
 def store_admin_create_item():
-    """Admin : crée ou met à jour un item du store."""
-    body = request.get_json(silent=True) or {}
+    """Admin : crée ou met à jour un item."""
+    body     = request.get_json(silent=True) or {}
     username = (body.get("username") or "").strip()
     password = (body.get("password") or "").strip()
     db = load_db()
     if not is_admin(db, username, password):
         return jsonify({"ok": False, "error": "Admin requis"}), 403
     iid   = (body.get("id") or str(_uuid.uuid4())[:8]).strip()
-    code  = (body.get("code") or "").strip()
     itype = (body.get("type") or "file").strip()
     if itype not in ("file", "note", "video_rental"):
-        return jsonify({"ok": False, "error": "Type invalide (file|note|video_rental)"}), 400
+        return jsonify({"ok": False, "error": "Type invalide"}), 400
     items = _store_redis_get(_STORE_ITEMS_KEY) or {}
     item  = items.get(iid, {})
     item["name"]        = (body.get("name") or item.get("name", "")).strip()
     item["description"] = (body.get("description") or item.get("description", "")).strip()
     item["type"]        = itype
+    code = (body.get("code") or "").strip()
     if code:
         item["code_hash"] = _store_hash_code(code)
     if itype == "note":
         item["content"] = body.get("content", item.get("content", ""))
-    elif itype == "file":
-        if body.get("r2_key"):
-            item["r2_key"] = body["r2_key"].strip()
-    elif itype == "video_rental":
-        if body.get("stream_video_id"):
-            item["stream_video_id"] = body["stream_video_id"].strip()
+    elif itype == "file" and body.get("r2_key"):
+        item["r2_key"] = body["r2_key"].strip()
+    elif itype == "video_rental" and body.get("stream_video_id"):
+        item["stream_video_id"] = body["stream_video_id"].strip()
     items[iid] = item
     _store_redis_set(_STORE_ITEMS_KEY, items)
     return jsonify({"ok": True, "id": iid, "item": item})
 
 @app.route("/store/admin/item", methods=["DELETE"])
 def store_admin_delete_item():
-    """Admin : supprime un item du store."""
-    body = request.get_json(silent=True) or {}
+    """Admin : supprime un item."""
+    body     = request.get_json(silent=True) or {}
     username = (body.get("username") or "").strip()
     password = (body.get("password") or "").strip()
     iid      = (body.get("id") or "").strip()
@@ -4074,26 +4100,24 @@ def store_admin_delete_item():
 
 @app.route("/store/admin/items", methods=["POST"])
 def store_admin_list_items():
-    """Admin : liste tous les items avec leurs codes hashés (pas les codes en clair)."""
-    body = request.get_json(silent=True) or {}
+    """Admin : liste tous les items."""
+    body     = request.get_json(silent=True) or {}
     username = (body.get("username") or "").strip()
     password = (body.get("password") or "").strip()
     db = load_db()
     if not is_admin(db, username, password):
         return jsonify({"ok": False, "error": "Admin requis"}), 403
-    items = _store_redis_get(_STORE_ITEMS_KEY) or {}
-    return jsonify({"ok": True, "items": items})
+    return jsonify({"ok": True, "items": _store_redis_get(_STORE_ITEMS_KEY) or {}})
 
 @app.route("/store/admin/unlocks", methods=["POST"])
 def store_admin_unlocks():
-    """Admin : liste tous les déblocages."""
-    body = request.get_json(silent=True) or {}
+    """Admin : tous les déblocages."""
+    body     = request.get_json(silent=True) or {}
     username = (body.get("username") or "").strip()
     password = (body.get("password") or "").strip()
     db = load_db()
     if not is_admin(db, username, password):
         return jsonify({"ok": False, "error": "Admin requis"}), 403
-    unlocks = _store_redis_get(_STORE_UNLOCKS_KEY) or {}
-    return jsonify({"ok": True, "unlocks": unlocks})
+    return jsonify({"ok": True, "unlocks": _store_redis_get(_STORE_UNLOCKS_KEY) or {}})
 
 # ── Fin NEXUS STORE ───────────────────────────────────────────────────────────
